@@ -5,7 +5,7 @@ use image::{imageops, RgbaImage};
 
 /// Sizes to try, best quality first; `scalable` (svg) last as a fallback.
 const SIZES: &[&str] = &["48x48", "64x64", "96x96", "32x32", "128x128", "24x24", "22x22", "16x16", "256x256"];
-const CATS: &[&str] = &["apps", "mimetypes", "places", "status", "devices", "actions"];
+const CATS: &[&str] = &["apps", "mimetypes", "places", "status", "devices", "actions", "legacy"];
 const EXTS: &[&str] = &["png", "svg", "jpg", "jpeg", "webp"];
 
 /// Resolve `spec` (a path or an icon theme name) and return it scaled to `target` px (square).
@@ -144,6 +144,14 @@ fn find_in_theme(name: &str) -> Option<String> {
                 }
             }
         }
+        // Flat fallback per dir: `<dir>/<name>.<ext>` (covers /usr/share/pixmaps,
+        // e.g. Icon=Alacritty with only Alacritty.svg in pixmaps).
+        for ext in EXTS {
+            let p = dir.join(format!("{name}.{ext}"));
+            if p.is_file() {
+                return p.to_str().map(str::to_string);
+            }
+        }
     }
     None
 }
@@ -192,5 +200,16 @@ mod tests {
     #[test]
     fn missing_icon_is_none() {
         assert!(load("definitely-not-an-icon-name-xyz", 32).is_none());
+    }
+
+    #[test]
+    fn resolves_pixmaps_svg_by_theme_name() {
+        // e.g. Alacritty ships only /usr/share/pixmaps/Alacritty.svg on Arch.
+        let pixmap = std::path::Path::new("/usr/share/pixmaps/Alacritty.svg");
+        if pixmap.exists() {
+            let img = load("Alacritty", 24).expect("pixmaps svg resolves by theme name");
+            assert_eq!(img.width(), 24);
+            assert_eq!(img.height(), 24);
+        }
     }
 }

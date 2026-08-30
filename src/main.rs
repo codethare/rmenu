@@ -129,6 +129,7 @@ fn main() {
     let pool = SlotPool::new((opts.width * height * 4) as usize, &shm)
         .expect("failed to allocate shm pool");
 
+    let item_count = items.len();
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
@@ -141,25 +142,21 @@ fn main() {
         qh: qh.clone(),
         keyboard: None,
         items,
-        matches: Vec::new(),
-        sel: 0,
+        menu: MenuState::new(item_count),
         top: 0,
-        query: String::new(),
         icons: HashMap::new(),
         font,
         prompt: opts.prompt.clone(),
         width: opts.width,
         lines: opts.lines,
         ci: opts.ci,
-        exit: None,
         dirty: false,
         frame_pending: false,
         first_configure: true,
         run: opts.run,
     };
-    app.matches = (0..app.items.len()).collect();
 
-    while app.exit.is_none() && event_queue.blocking_dispatch(&mut app).is_ok() {}
+    while app.menu.done.is_none() && event_queue.blocking_dispatch(&mut app).is_ok() {}
     app.finish();
 }
 
@@ -167,6 +164,67 @@ fn main() {
 fn visible_rows(items: &[items::Item], lines: usize, font: &font::MenuFont) -> (usize, u32) {
     let visible = if lines > 0 { lines.min(items.len()) } else { items.len().min(MAX_VISIBLE) };
     (visible, font.row_h * (visible as u32 + 1))
+}
+
+/// Menu outcome: `None` while running, `Some` once the user (or an error) closed it.
+#[derive(Debug, PartialEq)]
+enum Done {
+    Cancel,
+    Select(String),
+}
+
+/// Keyboard/filter state, Wayland-free so it is unit-testable.
+struct MenuState {
+    query: String,
+    matches: Vec<usize>,
+    sel: usize,
+    done: Option<Done>,
+}
+
+impl MenuState {
+    fn new(count: usize) -> Self {
+        Self { query: String::new(), matches: (0..count).collect(), sel: 0, done: None }
+    }
+
+    fn refilter(&mut self, items: &[items::Item], ci: bool) {
+        self.matches = items::filter(items, &self.query, ci);
+        self.sel = 0;
+    }
+
+    fn on_key(&mut self, keysym: Keysym, utf8: Option<String>, items: &[items::Item], ci: bool) {
+        match keysym {
+            Keysym::Escape => self.done = Some(Done::Cancel),
+            Keysym::Return | Keysym::KP_Enter => {
+                self.done = match self.matches.get(self.sel) {
+                    Some(&i) => Some(Done::Select(items[i].value.clone())),
+                    None => Some(Done::Cancel),
+                }
+            }
+            Keysym::BackSpace => {
+                if self.query.pop().is_some() {
+                    self.refilter(items, ci);
+                }
+            }
+            Keysym::Up => {
+                if self.sel > 0 {
+                    self.sel -= 1;
+                }
+            }
+            Keysym::Down => {
+                if self.sel + 1 < self.matches.len() {
+                    self.sel += 1;
+                }
+            }
+            _ => {
+                if let Some(t) = utf8 {
+                    if !t.is_empty() {
+                        self.query.push_str(&t);
+                        self.refilter(items, ci);
+                    }
+                }
+            }
+        }
+    }
 }
 
 #[allow(dead_code)] // state objects kept alive for their proxy bindings
@@ -182,18 +240,14 @@ struct App {
     qh: QueueHandle<App>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
     items: Vec<items::Item>,
-    matches: Vec<usize>,
-    sel: usize,
+    menu: MenuState,
     top: usize,
-    query: String,
     icons: HashMap<String, RgbaImage>,
     font: font::MenuFont,
     prompt: String,
     width: u32,
     lines: usize,
     ci: bool,
-    /// `None` = canceled (Escape), `Some(value)` = selected.
-    exit: Option<String>,
     dirty: bool,
     frame_pending: bool,
     first_configure: bool,
@@ -203,56 +257,15 @@ struct App {
 impl App {
     fn visible(&self) -> usize {
         if self.lines > 0 {
-            self.lines.min(self.matches.len())
+            self.lines.min(self.menu.matches.len())
         } else {
-            self.matches.len().min(MAX_VISIBLE)
+            self.menu.matches.len().min(MAX_VISIBLE)
         }
-    }
-
-    fn select(&mut self) {
-        self.exit = self.matches.get(self.sel).map(|&i| self.items[i].value.clone());
-    }
-
-    fn refilter(&mut self) {
-        self.matches = items::filter(&self.items, &self.query, self.ci());
-        self.sel = 0;
-        self.top = 0;
-        self.request_draw();
-    }
-
-    fn ci(&self) -> bool {
-        self.ci
     }
 
     fn on_key(&mut self, keysym: Keysym, utf8: Option<String>) {
-        match keysym {
-            Keysym::Escape => self.exit = None,
-            Keysym::Return | Keysym::KP_Enter => self.select(),
-            Keysym::BackSpace => {
-                self.query.pop();
-                self.refilter();
-            }
-            Keysym::Up => {
-                if self.sel > 0 {
-                    self.sel -= 1;
-                    self.request_draw();
-                }
-            }
-            Keysym::Down => {
-                if self.sel + 1 < self.matches.len() {
-                    self.sel += 1;
-                    self.request_draw();
-                }
-            }
-            _ => {
-                if let Some(t) = utf8 {
-                    if !t.is_empty() {
-                        self.query.push_str(&t);
-                        self.refilter();
-                    }
-                }
-            }
-        }
+        self.menu.on_key(keysym, utf8, &self.items, self.ci);
+        self.request_draw();
     }
 
     fn request_draw(&mut self) {
@@ -271,17 +284,17 @@ impl App {
 
         // Keep the selection in view.
         let visible = self.visible();
-        let total = self.matches.len();
-        if self.sel >= self.top + visible && visible > 0 {
-            self.top = self.sel + 1 - visible;
-        } else if self.sel < self.top {
-            self.top = self.sel;
+        let total = self.menu.matches.len();
+        if self.menu.sel >= self.top + visible && visible > 0 {
+            self.top = self.menu.sel + 1 - visible;
+        } else if self.menu.sel < self.top {
+            self.top = self.menu.sel;
         }
         let top = self.top.min(total.saturating_sub(1));
 
         // Resolve icons for the visible rows.
         let icon_sz = self.font.row_h - 2 * PAD;
-        for &mi in &self.matches[top..(top + visible).min(total)] {
+        for &mi in &self.menu.matches[top..(top + visible).min(total)] {
             if let Some(spec) = &self.items[mi].icon {
                 if !self.icons.contains_key(spec) {
                     if let Some(img) = icon::load(spec, icon_sz) {
@@ -292,12 +305,12 @@ impl App {
         }
 
         let mut rows: Vec<render::Row> = Vec::with_capacity(visible);
-        for (i, &mi) in self.matches[top..(top + visible).min(total)].iter().enumerate() {
+        for (i, &mi) in self.menu.matches[top..(top + visible).min(total)].iter().enumerate() {
             let it = &self.items[mi];
             rows.push(render::Row {
                 icon: it.icon.as_ref().and_then(|s| self.icons.get(s)),
                 text: &it.text,
-                selected: top + i == self.sel,
+                selected: top + i == self.menu.sel,
             });
         }
 
@@ -312,17 +325,17 @@ impl App {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("rmenu: buffer error: {e}");
-                self.exit = None;
+                self.menu.done = Some(Done::Cancel);
                 return;
             }
         };
-        render::draw(canvas, w, h, &self.font, &self.prompt, &self.query, &rows, PAD);
+        render::draw(canvas, w, h, &self.font, &self.prompt, &self.menu.query, &rows, PAD);
 
         layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
         let surface = layer.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         if buffer.attach_to(layer.wl_surface()).is_err() {
-            self.exit = None;
+            self.menu.done = Some(Done::Cancel);
             return;
         }
         layer.commit();
@@ -331,8 +344,8 @@ impl App {
     }
 
     fn finish(&mut self) {
-        match self.exit.take() {
-            Some(value) => {
+        match self.menu.done.take() {
+            Some(Done::Select(value)) => {
                 if self.run {
                     let _ = std::process::Command::new("sh")
                         .arg("-c")
@@ -344,7 +357,7 @@ impl App {
                 println!("{value}");
                 exit(0);
             }
-            None => exit(1),
+            _ => exit(1),
         }
     }
 }
@@ -384,7 +397,7 @@ impl CompositorHandler for App {
 
 impl LayerShellHandler for App {
     fn closed(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &LayerSurface) {
-        self.exit = None;
+        self.menu.done = Some(Done::Cancel);
     }
 
     fn configure(
@@ -524,3 +537,87 @@ impl ProvidesRegistryState for App {
 }
 
 smithay_client_toolkit::delegate_dispatch2!(App);
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_items() -> Vec<items::Item> {
+        ["firefox", "alacritty", "libreoffice"]
+            .iter()
+            .map(|s| items::Item {
+                icon: None,
+                text: s.to_string(),
+                value: s.to_string(),
+            })
+            .collect()
+    }
+
+    /// xkeysym for any printable 'F' key; the `_` arm only uses the utf8 text.
+    fn type_key(m: &mut MenuState, items: &[items::Item], c: char) {
+        m.on_key(Keysym::from(0x66u32), Some(c.to_string()), items, false);
+    }
+
+    #[test]
+    fn escape_cancels() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        assert!(m.done.is_none());
+        m.on_key(Keysym::Escape, None, &items, false);
+        assert_eq!(m.done, Some(Done::Cancel));
+    }
+
+    #[test]
+    fn enter_selects_highlighted_value() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Select("firefox".into())));
+    }
+
+    #[test]
+    fn typing_filters_and_enter_picks_only_match() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'l');
+        type_key(&mut m, &items, 'i');
+        assert_eq!(m.matches.len(), 1);
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn enter_with_no_match_cancels() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'z');
+        assert!(m.matches.is_empty());
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Cancel));
+    }
+
+    #[test]
+    fn backspace_restores_matches() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'a'); // only "alacritty"
+        assert_eq!(m.matches.len(), 1);
+        m.on_key(Keysym::BackSpace, None, &items, false);
+        assert_eq!(m.matches.len(), 3);
+    }
+
+    #[test]
+    fn arrows_move_selection_within_bounds() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::Up, None, &items, false); // clamp at top
+        assert_eq!(m.sel, 0);
+        m.on_key(Keysym::Down, None, &items, false);
+        assert_eq!(m.sel, 1);
+        m.on_key(Keysym::Down, None, &items, false);
+        m.on_key(Keysym::Down, None, &items, false); // clamp at bottom
+        assert_eq!(m.sel, 2);
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+}
