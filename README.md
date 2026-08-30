@@ -1,25 +1,26 @@
 # rmenu
 
 A [wmenu](https://codeberg.org/adnano/wmenu)-style dynamic menu for Wayland,
-written in Rust — with program icons.
+written in Rust.
 
 `rmenu` is a layer-shell dropdown menu: type to filter, arrows to move,
-Enter to select, Escape to cancel. It renders text and icons entirely in
-software (wl_shm + its own rasterizer), so there are no cairo/pango
-dependencies — the whole UI is drawn by `ab_glyph` + `image`/`resvg`.
+Enter to select, Escape to cancel. It renders text entirely in software
+(wl_shm + its own rasterizer), so there are no cairo/pango dependencies —
+the whole UI is drawn by `ab_glyph`.
 
 ## Features
 
 - wmenu/dmenu-style filtering: every space-separated query token must be a
   substring; ranking is exact > prefix > substring
 - `Ctrl`-free text input, `Up`/`Down` navigation, key repeat, long-list
-  scrolling, case-insensitive matching (`-i`)
-- **Icons**: each line may carry an icon — a file path or a freedesktop
-  icon-theme name (png/jpg/webp via `image`, svg via `resvg`, themes looked
-  up in `hicolor`/`Adwaita`/`XDG_CURRENT_DESKTOP` and `~/.local/share/icons`)
-- `--run` launcher mode: scans `.desktop` files, shows each program's icon,
-  launches the selection via `sh -c` — and merges in everything executable on
-  `$PATH` (scripts included), deduped with the desktop entries winning
+  scrolling, case-insensitive matching (`-i`), `Tab` completes the highlighted
+  entry into the input
+- Spotlight-style UI: rounded corners; launch shows only the input bar in the
+  upper-center of the screen, results appear as you type, and the menu
+  collapses back to the bar when the query is cleared
+- `--run` launcher mode: scans `.desktop` files and launches the selection
+  via `sh -c` — and merges in everything executable on `$PATH` (scripts
+  included), deduped with the desktop entries winning
 - CJK text renders (auto-picks a CJK-capable system font)
 
 ## Build / run
@@ -32,17 +33,25 @@ Modes:
 
 ```sh
 # stdin → menu → selection printed to stdout
-printf 'firefox\tFirefox\norg.gnome.Terminal\tTerminal\n' | rmenu
+printf 'firefox\nFirefox\nalacritty\n' | rmenu
 
-# launcher (programs + icons, plus PATH scripts/commands)
+# launcher (desktop entries + PATH scripts/commands)
 rmenu --run
 
-# with a plain dmenu-style pipe
+# with filters
 printf 'alacritty\nfirefox\n' | rmenu -i -p 'run: '
 ```
 
-Options (wmenu-compatible subset): `-p prompt`, `-i` (case-insensitive),
-`-l lines` (visible rows), `-W width`, `-f font.ttf`, `--run`, `-h`.
+Options (wmenu-compatible subset): `-b` (menu at screen bottom), `-P` (mask typed
+input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W width`,
+`-p prompt`, `-f font.ttf`, `-v` (print version), `--run`, `-h`.
+
+Colors are wmenu-style `RRGGBB[AA]`: `-N` normal bg, `-n` normal fg, `-M` prompt bg,
+`-m` prompt fg, `-S` selection bg, `-s` selection fg. Example:
+
+```sh
+printf 'alacritty\nfirefox\n' | rmenu -N 111111 -n cccccc -S 005577 -s ffffff
+```
 
 ### Sway
 
@@ -50,13 +59,6 @@ Options (wmenu-compatible subset): `-p prompt`, `-i` (case-insensitive),
 set $menu rmenu --run
 bindsym $mod+d exec $menu
 ```
-
-### Input format
-
-Lines from stdin are `icon<TAB>label`. The icon field is either a path
-(`/usr/share/icons/hicolor/48x48/apps/firefox.png`) or a theme icon name
-(`firefox`). On selection, the label (text after the tab) is printed to
-stdout; plain lines are printed as-is, like dmenu.
 
 ## Known limits
 

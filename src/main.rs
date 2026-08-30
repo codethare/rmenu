@@ -1,19 +1,16 @@
-//! rmenu — a wmenu/dmenu-style menu for Wayland (wlr-layer-shell) with program icons.
+//! rmenu — a wmenu/dmenu-style menu for Wayland (wlr-layer-shell).
 //!
-//! Plain text or `--run` launcher mode. `--run` scans .desktop files and shows their
-//! icons; otherwise lines are read from stdin, optionally as `<icon>\t<label>`.
+//! Plain text or `--run` launcher mode. `--run` scans .desktop files;
+//! otherwise lines are read from stdin.
 
 mod desktop;
 mod font;
-mod icon;
 mod items;
 mod render;
 
-use std::collections::HashMap;
 use std::io::{self, BufRead};
 use std::process::exit;
 
-use image::RgbaImage;
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
     delegate_registry,
@@ -41,7 +38,10 @@ use wayland_client::{
 
 const DEFAULT_WIDTH: u32 = 640;
 const FONT_SIZE: f32 = 16.0;
-const PAD: u32 = 4;
+/// Panel content inset: must be >= corner radius so text never grazes the curve.
+const PAD: u32 = 12;
+/// Away-from-edge float for the upper-center panel (bottom mode keeps 8px).
+const TOP_MARGIN: i32 = 32;
 /// ponytail: stdin can be huge; cap drawn rows and scroll instead of mapping a giant buffer.
 const MAX_VISIBLE: usize = 64;
 
@@ -52,30 +52,55 @@ struct Opts {
     ci: bool,
     font: Option<String>,
     run: bool,
+    bottom: bool,
+    password: bool,
+    colors: render::Colors,
 }
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rmenu [-i] [-p prompt] [-l lines] [-W width] [-f font.ttf] [--run]\n\
+        "usage: rmenu [-biPv] [-f font.ttf|FAMILY [style] [size]] [-l lines] [-W width] [-p prompt] [--run]\n\
+               [-N color] [-n color] [-M color] [-m color] [-S color] [-s color]\n\
          \n\
-         Reads lines from stdin; each line may be `icon<TAB>label` where icon is a\n\
-         path or a freedesktop icon theme name. Prints the selected label to stdout.\n\
-         `--run` ignores stdin, lists .desktop applications with their icons, and\n\
-         launches the selection. `-i` matches case-insensitively."
+         Reads lines from stdin and prints the selected line to stdout.\n\
+         `--run` ignores stdin, lists .desktop applications, and launches the selection.\n\
+         `-b` shows the menu at the bottom of the screen; `-P` masks typed input as asterisks;\n\
+         `-i` matches case-insensitively.\n\
+         Colors are wmenu-style `RRGGBB[AA]`: `-N`/`-n` normal bg/fg, `-M`/`-m` prompt bg/fg,\n\
+         `-S`/`-s` selection bg/fg."
     );
     exit(1);
 }
 
-fn parse_opts() -> Opts {
-    let mut o = Opts { prompt: String::new(), width: DEFAULT_WIDTH, lines: 0, ci: false, font: None, run: false };
-    let mut args = std::env::args().skip(1);
+fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
+    let mut o = Opts {
+        prompt: String::new(),
+        width: DEFAULT_WIDTH,
+        lines: 0,
+        ci: false,
+        font: None,
+        run: false,
+        bottom: false,
+        password: false,
+        colors: render::Colors::default(),
+    };
+    let mut args = args;
     while let Some(a) = args.next() {
+        let color = |s: String| render::parse_color(&s).unwrap_or_else(|| usage());
         match a.as_str() {
             "-i" => o.ci = true,
+            "-b" => o.bottom = true,
+            "-P" => o.password = true,
             "-p" => o.prompt = args.next().unwrap_or_else(|| usage()),
             "-l" => o.lines = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage()),
             "-W" => o.width = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage()),
             "-f" => o.font = Some(args.next().unwrap_or_else(|| usage())),
+            "-N" => o.colors.bg_normal = color(args.next().unwrap_or_else(|| usage())),
+            "-n" => o.colors.fg_normal = color(args.next().unwrap_or_else(|| usage())),
+            "-M" => o.colors.bg_prompt = color(args.next().unwrap_or_else(|| usage())),
+            "-m" => o.colors.fg_prompt = color(args.next().unwrap_or_else(|| usage())),
+            "-S" => o.colors.bg_sel = color(args.next().unwrap_or_else(|| usage())),
+            "-s" => o.colors.fg_sel = color(args.next().unwrap_or_else(|| usage())),
             "--run" => o.run = true,
             "-h" | "--help" => usage(),
             _ => {
@@ -85,6 +110,15 @@ fn parse_opts() -> Opts {
         }
     }
     o
+}
+
+fn parse_opts() -> Opts {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.iter().any(|a| a == "-v" || a == "--version") {
+        println!("rmenu {}", env!("CARGO_PKG_VERSION"));
+        exit(0);
+    }
+    parse_opts_from(args.into_iter())
 }
 
 fn main() {
@@ -120,10 +154,12 @@ fn main() {
     let (_visible, height) = visible_rows(&items, opts.lines, &font);
     let surface = compositor.create_surface(&qh);
     let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("rmenu"), None);
-    layer.set_anchor(Anchor::TOP);
-    layer.set_margin(0, 0, 8, 0);
+    layer.set_anchor(if opts.bottom { Anchor::BOTTOM } else { Anchor::TOP });
+    layer.set_margin(if opts.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
-    layer.set_size(opts.width, height);
+    // Start collapsed to the single input bar (Spotlight); the list appears
+    // once the query has content. The pool keeps the max height for rows.
+    layer.set_size(opts.width, font.row_h);
     layer.commit();
 
     let pool = SlotPool::new((opts.width * height * 4) as usize, &shm)
@@ -144,12 +180,15 @@ fn main() {
         items,
         menu: MenuState::new(item_count),
         top: 0,
-        icons: HashMap::new(),
         font,
         prompt: opts.prompt.clone(),
         width: opts.width,
         lines: opts.lines,
         ci: opts.ci,
+        colors: opts.colors,
+        password: opts.password,
+        bottom: opts.bottom,
+        output_w: None,
         dirty: false,
         frame_pending: false,
         first_configure: true,
@@ -195,9 +234,15 @@ impl MenuState {
         match keysym {
             Keysym::Escape => self.done = Some(Done::Cancel),
             Keysym::Return | Keysym::KP_Enter => {
-                self.done = match self.matches.get(self.sel) {
-                    Some(&i) => Some(Done::Select(items[i].value.clone())),
-                    None => Some(Done::Cancel),
+                // With the list hidden (empty query) there is nothing visible to
+                // pick — treat Enter as cancel instead of selecting blind.
+                self.done = if self.query.is_empty() {
+                    Some(Done::Cancel)
+                } else {
+                    match self.matches.get(self.sel) {
+                        Some(&i) => Some(Done::Select(items[i].value.clone())),
+                        None => Some(Done::Cancel),
+                    }
                 }
             }
             Keysym::BackSpace => {
@@ -215,9 +260,26 @@ impl MenuState {
                     self.sel += 1;
                 }
             }
+            Keysym::Tab => {
+                // dmenu habit: complete the highlighted item into the query.
+                if let Some(&i) = self.matches.get(self.sel) {
+                    let text = items[i].text.clone();
+                    if text != self.query {
+                        self.query = text;
+                        self.refilter(items, ci);
+                        // refilter resets sel to 0; anchor back on the completed item
+                        // (prefix ties like "libreoffice" vs "libreoffice-stable").
+                        if let Some(p) = self.matches.iter().position(|&m| m == i) {
+                            self.sel = p;
+                        }
+                    }
+                }
+            }
             _ => {
                 if let Some(t) = utf8 {
-                    if !t.is_empty() {
+                    // xkb encodes ctrl+key as a control char (ctrl+a -> U+0001);
+                    // never let those become query text.
+                    if !t.is_empty() && !t.chars().any(char::is_control) {
                         self.query.push_str(&t);
                         self.refilter(items, ci);
                     }
@@ -242,12 +304,17 @@ struct App {
     items: Vec<items::Item>,
     menu: MenuState,
     top: usize,
-    icons: HashMap<String, RgbaImage>,
     font: font::MenuFont,
     prompt: String,
     width: u32,
     lines: usize,
     ci: bool,
+    colors: render::Colors,
+    password: bool,
+    bottom: bool,
+    /// Logical width of the output the panel is mapped on; `None` until
+    /// surface_enter, used to center the panel horizontally (Spotlight).
+    output_w: Option<u32>,
     dirty: bool,
     frame_pending: bool,
     first_configure: bool,
@@ -282,40 +349,35 @@ impl App {
         }
         let Some(layer) = self.layer.clone() else { return };
 
-        // Keep the selection in view.
-        let visible = self.visible();
+        // Spotlight: no list until the query has content; collapse back to the
+        // single input bar when the query is cleared.
+        let visible = if self.menu.query.is_empty() { 0 } else { self.visible() };
         let total = self.menu.matches.len();
-        if self.menu.sel >= self.top + visible && visible > 0 {
-            self.top = self.menu.sel + 1 - visible;
-        } else if self.menu.sel < self.top {
-            self.top = self.menu.sel;
-        }
-        let top = self.top.min(total.saturating_sub(1));
 
-        // Resolve icons for the visible rows.
-        let icon_sz = self.font.row_h - 2 * PAD;
-        for &mi in &self.menu.matches[top..(top + visible).min(total)] {
-            if let Some(spec) = &self.items[mi].icon {
-                if !self.icons.contains_key(spec) {
-                    if let Some(img) = icon::load(spec, icon_sz) {
-                        self.icons.insert(spec.clone(), img);
-                    }
-                }
-            }
-        }
-
+        // Keep the selection in view (only meaningful while the list is shown).
         let mut rows: Vec<render::Row> = Vec::with_capacity(visible);
-        for (i, &mi) in self.menu.matches[top..(top + visible).min(total)].iter().enumerate() {
-            let it = &self.items[mi];
-            rows.push(render::Row {
-                icon: it.icon.as_ref().and_then(|s| self.icons.get(s)),
-                text: &it.text,
-                selected: top + i == self.menu.sel,
-            });
+        if visible > 0 {
+            if self.menu.sel >= self.top + visible && visible > 0 {
+                self.top = self.menu.sel + 1 - visible;
+            } else if self.menu.sel < self.top {
+                self.top = self.menu.sel;
+            }
+            let top = self.top.min(total.saturating_sub(1));
+            for (i, &mi) in self.menu.matches[top..(top + visible).min(total)].iter().enumerate() {
+                let it = &self.items[mi];
+                rows.push(render::Row { text: &it.text, selected: top + i == self.menu.sel });
+            }
         }
 
         let w = self.width;
         let h = self.font.row_h * (visible as u32 + 1);
+        if self.bottom {
+            layer.set_margin(8, 0, 0, 0);
+        } else {
+            // Upper-center: 24px top breathing room, horizontally centered.
+            let left = self.output_w.map(|ow| ((ow as i64 - w as i64) / 2).max(0) as i32).unwrap_or(0);
+            layer.set_margin(TOP_MARGIN, 0, 0, left);
+        }
         layer.set_size(w, h);
 
         let (buffer, canvas) = match self
@@ -329,7 +391,7 @@ impl App {
                 return;
             }
         };
-        render::draw(canvas, w, h, &self.font, &self.prompt, &self.menu.query, &rows, PAD);
+        render::draw(canvas, w, h, &self.font, &self.prompt, &self.menu.query, self.password, &rows, PAD, &self.colors);
 
         layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
         let surface = layer.wl_surface().clone();
@@ -391,7 +453,25 @@ impl CompositorHandler for App {
             self.draw();
         }
     }
-    fn surface_enter(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_enter(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        output: &wl_output::WlOutput,
+    ) {
+        if let Some(w) = self
+            .output_state
+            .info(output)
+            .and_then(|i| i.logical_size)
+            .map(|(w, _)| w.max(0) as u32)
+        {
+            if self.output_w != Some(w) {
+                self.output_w = Some(w); // center the panel on this output
+                self.request_draw();
+            }
+        }
+    }
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
 
@@ -545,12 +625,32 @@ mod tests {
     fn sample_items() -> Vec<items::Item> {
         ["firefox", "alacritty", "libreoffice"]
             .iter()
-            .map(|s| items::Item {
-                icon: None,
-                text: s.to_string(),
-                value: s.to_string(),
-            })
+            .map(|s| items::Item { text: s.to_string(), value: s.to_string() })
             .collect()
+    }
+
+    fn opts(args: &[&str]) -> Opts {
+        parse_opts_from(args.iter().map(|s| s.to_string()))
+    }
+
+    #[test]
+    fn color_flags_match_wmenu_fields() {
+        // `-M`/`-m` are the prompt rows, `-S`/`-s` the selection (wmenu semantics).
+        let o = opts(&["-N", "112233", "-n", "445566", "-M", "778899", "-m", "aabbcc", "-S", "ddeeff", "-s", "010203"]);
+        assert_eq!(o.colors.bg_normal, [0x33, 0x22, 0x11, 0xff]);
+        assert_eq!(o.colors.fg_normal, [0x66, 0x55, 0x44, 0xff]);
+        assert_eq!(o.colors.bg_prompt, [0x99, 0x88, 0x77, 0xff]);
+        assert_eq!(o.colors.fg_prompt, [0xcc, 0xbb, 0xaa, 0xff]);
+        assert_eq!(o.colors.bg_sel, [0xff, 0xee, 0xdd, 0xff]);
+        assert_eq!(o.colors.fg_sel, [0x03, 0x02, 0x01, 0xff]);
+    }
+
+    #[test]
+    fn bottom_and_password_flags() {
+        let o = opts(&["-b", "-P"]);
+        assert!(o.bottom && o.password);
+        let d = opts(&[]);
+        assert!(!d.bottom && !d.password);
     }
 
     /// xkeysym for any printable 'F' key; the `_` arm only uses the utf8 text.
@@ -571,8 +671,17 @@ mod tests {
     fn enter_selects_highlighted_value() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'f'); // narrows to firefox + libreoffice, firefox first
         m.on_key(Keysym::Return, None, &items, false);
         assert_eq!(m.done, Some(Done::Select("firefox".into())));
+    }
+
+    #[test]
+    fn enter_with_empty_query_cancels() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Cancel));
     }
 
     #[test]
@@ -597,6 +706,17 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_chords_do_not_garbble_query() {
+        // Wayland hands ctrl+a .. ctrl+z to us as U+0001..U+001A control chars.
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::from(0x61u32), Some("\u{1}".into()), &items, false);
+        m.on_key(Keysym::from(0x76u32), Some("\u{16}".into()), &items, false);
+        assert_eq!(m.query, "");
+        assert_eq!(m.matches.len(), 3);
+    }
+
+    #[test]
     fn backspace_restores_matches() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
@@ -610,6 +730,7 @@ mod tests {
     fn arrows_move_selection_within_bounds() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'i'); // matches all three, original order (no prefix hit)
         m.on_key(Keysym::Up, None, &items, false); // clamp at top
         assert_eq!(m.sel, 0);
         m.on_key(Keysym::Down, None, &items, false);
@@ -619,5 +740,41 @@ mod tests {
         assert_eq!(m.sel, 2);
         m.on_key(Keysym::Return, None, &items, false);
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn tab_completes_highlighted_item_into_query() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'o'); // matches: firefox, libreoffice
+        m.on_key(Keysym::Down, None, &items, false); // highlight libreoffice (2nd match)
+        m.on_key(Keysym::Tab, None, &items, false);
+        assert_eq!(m.query, "libreoffice");
+        assert_eq!(m.matches.len(), 1); // refiltered to the completed item
+        assert_eq!(m.sel, 0);
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn tab_with_hidden_list_fills_first_item() {
+        // Spotlight collapses the list on empty query, but the internal
+        // selection still exists — Tab fills it like any other state.
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::Tab, None, &items, false);
+        assert_eq!(m.query, "firefox");
+        m.on_key(Keysym::Return, None, &items, false);
+        assert_eq!(m.done, Some(Done::Select("firefox".into())));
+    }
+
+    #[test]
+    fn tab_with_no_match_is_noop() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'z'); // no matches
+        m.on_key(Keysym::Tab, None, &items, false);
+        assert_eq!(m.query, "z");
+        assert!(m.matches.is_empty());
     }
 }
