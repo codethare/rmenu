@@ -1,0 +1,15 @@
+[package]
+name = "rmenu"
+version = "0.1.0"
+edition = "2024"
+description = "A wmenu/dmenu-style Wayland menu written in Rust, with program icon support"
+
+[dependencies]
+ab_glyph = "0.2.32"
+fontdb = "0.24.0"
+image = "0.25.10"
+resvg = "0.48.1"
+smithay-client-toolkit = "0.21.1"
+tiny-skia = "0.12.0"
+usvg = "0.48.1"
+wayland-client = "0.31.14"
