@@ -18,7 +18,8 @@ dependencies — the whole UI is drawn by `ab_glyph` + `image`/`resvg`.
   icon-theme name (png/jpg/webp via `image`, svg via `resvg`, themes looked
   up in `hicolor`/`Adwaita`/`XDG_CURRENT_DESKTOP` and `~/.local/share/icons`)
 - `--run` launcher mode: scans `.desktop` files, shows each program's icon,
-  launches the selection via `sh -c`
+  launches the selection via `sh -c` — and merges in everything executable on
+  `$PATH` (scripts included), deduped with the desktop entries winning
 - CJK text renders (auto-picks a CJK-capable system font)
 
 ## Build / run
@@ -33,7 +34,7 @@ Modes:
 # stdin → menu → selection printed to stdout
 printf 'firefox\tFirefox\norg.gnome.Terminal\tTerminal\n' | rmenu
 
-# launcher (programs + icons)
+# launcher (programs + icons, plus PATH scripts/commands)
 rmenu --run
 
 # with a plain dmenu-style pipe

@@ -104,8 +104,76 @@ fn clean_exec(exec: &str) -> String {
     words[..end].join(" ")
 }
 
+/// Executables found in `$PATH` (scripts, binaries, symlinks), deduped by file name.
+pub fn path_commands() -> Vec<String> {
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut out = Vec::new();
+    let path = std::env::var("PATH").unwrap_or_default();
+    for dir in path.split(':').filter(|d| !d.is_empty()) {
+        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if name.starts_with('.') || !seen.insert(name.clone()) {
+                continue;
+            }
+            if is_executable(&e.path()) {
+                out.push(name);
+            }
+        }
+    }
+    out
+}
+
+fn is_executable(p: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(p).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
+}
+
+/// Merge desktop apps and PATH commands into menu items: apps win on name
+/// collision (case-insensitive), result sorted by name. Commands carry no icon.
+pub fn merged(apps: Vec<App>, cmds: Vec<String>) -> Vec<crate::items::Item> {
+    let mut items: Vec<crate::items::Item> = apps
+        .into_iter()
+        .map(|a| crate::items::Item { icon: a.icon, text: a.name, value: a.exec })
+        .collect();
+    let mut seen: HashSet<String> = items.iter().map(|i| i.text.to_lowercase()).collect();
+    for cmd in cmds {
+        if seen.insert(cmd.to_lowercase()) {
+            items.push(crate::items::Item { icon: None, text: cmd.clone(), value: cmd });
+        }
+    }
+    items.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()));
+    items
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn merge_apps_and_commands_dedups_by_name() {
+        let apps = vec![
+            App { name: "Firefox".into(), exec: "firefox %u".into(), icon: Some("firefox".into()) },
+            App { name: "Zathura".into(), exec: "zathura %f".into(), icon: None },
+        ];
+        let cmds = vec!["firefox".to_string(), "alacritty".to_string(), "zathura".to_string()];
+        let items = merged(apps, cmds);
+        let names: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
+        // deduped, sorted, desktop entry (icon) wins over the bare command
+        assert_eq!(names, vec!["alacritty", "Firefox", "Zathura"]);
+        assert!(items[1].icon.is_some() && items[2].icon.is_none());
+    }
+
+    #[test]
+    fn path_commands_finds_shell_utilities() {
+        let cmds = path_commands();
+        assert!(cmds.iter().any(|c| c == "sh"), "PATH should contain sh: {cmds:?}");
+        assert!(cmds.iter().any(|c| c == "ls" || c == "env" || c == "cat"));
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
     use super::*;
 
     #[test]

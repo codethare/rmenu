@@ -91,10 +91,7 @@ fn main() {
     let opts = parse_opts();
 
     let items: Vec<items::Item> = if opts.run {
-        desktop::load_apps()
-            .into_iter()
-            .map(|a| items::Item { icon: a.icon, text: a.name, value: a.exec })
-            .collect()
+        desktop::merged(desktop::load_apps(), desktop::path_commands())
     } else {
         let stdin = io::stdin();
         stdin.lock().lines().filter_map(|l| l.ok()).map(|l| items::parse(&l)).collect()
