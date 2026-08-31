@@ -239,10 +239,13 @@ impl MenuState {
                 self.done = if self.query.is_empty() {
                     Some(Done::Cancel)
                 } else {
-                    match self.matches.get(self.sel) {
-                        Some(&i) => Some(Done::Select(items[i].value.clone())),
-                        None => Some(Done::Cancel),
-                    }
+                    Some(match self.matches.get(self.sel) {
+                        Some(&i) => Done::Select(items[i].value.clone()),
+                        // dmenu/wmenu contract: Enter with no match echoes the
+                        // typed line. Keeps `echo "" | rmenu -p …` prompt-style
+                        // scripts working (they type an answer with no list).
+                        None => Done::Select(self.query.clone()),
+                    })
                 }
             }
             Keysym::BackSpace => {
@@ -696,13 +699,15 @@ mod tests {
     }
 
     #[test]
-    fn enter_with_no_match_cancels() {
+    fn enter_with_no_match_echoes_query() {
+        // dmenu/wmenu contract: with nothing to pick, Enter prints the typed
+        // line — that's how `echo "" | rmenu -p …` prompt scripts work.
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'z');
         assert!(m.matches.is_empty());
         m.on_key(Keysym::Return, None, &items, false);
-        assert_eq!(m.done, Some(Done::Cancel));
+        assert_eq!(m.done, Some(Done::Select("z".into())));
     }
 
     #[test]
