@@ -1,62 +1,51 @@
-//! dmenu/wmenu-style items: `<icon>\t<text>` input lines and token substring filtering.
+//! dmenu/wmenu-style items: stdin text lines and token substring filtering.
 
 #[derive(Debug, Clone)]
 pub struct Item {
-    /// Icon path or theme icon name; `None` when the line had no tab field.
-    pub icon: Option<String>,
-    /// Display text (everything after the first tab, or the whole line).
+    /// Display text.
     pub text: String,
-    /// Value printed to stdout when selected (the text, sans icon field).
+    /// Value printed to stdout when selected.
     pub value: String,
+    /// Lowercased copy of `text`, precomputed so `-i` filtering never
+    /// lowercases per item per token on every keystroke.
+    pub lc: String,
 }
 
 pub fn parse(line: &str) -> Item {
-    match line.split_once('\t') {
-        Some((icon, rest)) => Item {
-            icon: Some(icon.trim().to_string()),
-            text: rest.to_string(),
-            value: rest.to_string(),
-        },
-        None => Item {
-            icon: None,
-            text: line.to_string(),
-            value: line.to_string(),
-        },
-    }
+    Item { lc: line.to_lowercase(), text: line.to_string(), value: line.to_string() }
 }
 
-fn contains(haystack: &str, needle: &str, ci: bool) -> bool {
-    if ci {
-        haystack.to_lowercase().contains(&needle.to_lowercase())
-    } else {
-        haystack.contains(needle)
-    }
+fn contains(haystack: &str, needle: &str) -> bool {
+    haystack.contains(needle)
 }
 
-fn starts_with(haystack: &str, needle: &str, ci: bool) -> bool {
-    if ci {
-        haystack.to_lowercase().starts_with(&needle.to_lowercase())
-    } else {
-        haystack.starts_with(needle)
-    }
+fn starts_with(haystack: &str, needle: &str) -> bool {
+    haystack.starts_with(needle)
 }
 
 /// wmenu-style matching: every whitespace-separated query token must be a substring
 /// of the item text; ranking is exact > prefix > substring, stable within each bucket.
 /// Returns indices into `items`. An empty query matches everything, in order.
 pub fn filter(items: &[Item], query: &str, ci: bool) -> Vec<usize> {
+    // Hot path (per keystroke): lowercase the query once instead of per item
+    // per token; each item's lowercase copy was precomputed at parse time.
+    if query.is_empty() {
+        return (0..items.len()).collect();
+    }
+    let query = if ci { query.to_lowercase() } else { query.to_string() };
     let toks: Vec<&str> = query.split_whitespace().collect();
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
     let mut sub = Vec::new();
     for (i, it) in items.iter().enumerate() {
-        if !toks.iter().all(|t| contains(&it.text, t, ci)) {
+        let hay = if ci { &it.lc } else { &it.text };
+        if !toks.iter().all(|t| contains(hay, t)) {
             continue;
         }
         let bucket = match toks.len() {
             0 => &mut exact,
-            _ if starts_with(&it.text, query, ci) => &mut exact,
-            _ if starts_with(&it.text, toks[0], ci) => &mut prefix,
+            _ if starts_with(hay, &query) => &mut exact,
+            _ if starts_with(hay, toks[0]) => &mut prefix,
             _ => &mut sub,
         };
         bucket.push(i);
@@ -73,14 +62,10 @@ mod tests {
     }
 
     #[test]
-    fn parse_splits_tab_icon() {
-        let it = parse("firefox\tFirefox 火狐");
-        assert_eq!(it.icon.as_deref(), Some("firefox"));
+    fn parse_keeps_line_verbatim() {
+        let it = parse("Firefox 火狐");
         assert_eq!(it.text, "Firefox 火狐");
         assert_eq!(it.value, "Firefox 火狐");
-        let plain = parse("just a line");
-        assert!(plain.icon.is_none());
-        assert_eq!(plain.value, "just a line");
     }
 
     #[test]

@@ -59,7 +59,7 @@ struct Opts {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rmenu [-biPv] [-f font.ttf|FAMILY [style] [size]] [-l lines] [-W width] [-p prompt] [--run]\n\
+        "usage: rmenu [-biPv] [-f font.ttf|FAMILY [style] [pt|Npx]] [-l lines] [-W width] [-p prompt] [--run]\n\
                [-N color] [-n color] [-M color] [-m color] [-S color] [-s color]\n\
          \n\
          Reads lines from stdin and prints the selected line to stdout.\n\
@@ -193,6 +193,7 @@ fn main() {
         frame_pending: false,
         first_configure: true,
         run: opts.run,
+        mods: Modifiers::default(),
     };
 
     while app.menu.done.is_none() && event_queue.blocking_dispatch(&mut app).is_ok() {}
@@ -218,11 +219,19 @@ struct MenuState {
     matches: Vec<usize>,
     sel: usize,
     done: Option<Done>,
+    /// Values picked by Ctrl-Return while the menu keeps running (multi-select).
+    picked: Vec<String>,
 }
 
 impl MenuState {
     fn new(count: usize) -> Self {
-        Self { query: String::new(), matches: (0..count).collect(), sel: 0, done: None }
+        Self {
+            query: String::new(),
+            matches: (0..count).collect(),
+            sel: 0,
+            done: None,
+            picked: Vec::new(),
+        }
     }
 
     fn refilter(&mut self, items: &[items::Item], ci: bool) {
@@ -230,24 +239,52 @@ impl MenuState {
         self.sel = 0;
     }
 
-    fn on_key(&mut self, keysym: Keysym, utf8: Option<String>, items: &[items::Item], ci: bool) {
+    /// The value Return picks: the highlighted item, or (dmenu/wmenu contract)
+    /// the typed line when there is no match — that's how `echo "" | rmenu -p …`
+    /// prompt-style scripts work.
+    fn pick_value(&self, items: &[items::Item]) -> String {
+        match self.matches.get(self.sel) {
+            Some(&i) => items[i].value.clone(),
+            None => self.query.clone(),
+        }
+    }
+
+    /// Plain Return: select the highlighted item, or cancel on an empty query
+    /// (with the list hidden there is nothing visible to pick, so Enter
+    /// cancels instead of selecting blind).
+    fn enter(&mut self, items: &[items::Item]) {
+        self.done = if self.query.is_empty() {
+            Some(Done::Cancel)
+        } else {
+            Some(Done::Select(self.pick_value(items)))
+        };
+    }
+
+    fn on_key(
+        &mut self,
+        keysym: Keysym,
+        utf8: Option<String>,
+        mods: Modifiers,
+        items: &[items::Item],
+        ci: bool,
+        visible: usize,
+    ) {
         match keysym {
             Keysym::Escape => self.done = Some(Done::Cancel),
-            Keysym::Return | Keysym::KP_Enter => {
-                // With the list hidden (empty query) there is nothing visible to
-                // pick — treat Enter as cancel instead of selecting blind.
-                self.done = if self.query.is_empty() {
-                    Some(Done::Cancel)
-                } else {
-                    Some(match self.matches.get(self.sel) {
-                        Some(&i) => Done::Select(items[i].value.clone()),
-                        // dmenu/wmenu contract: Enter with no match echoes the
-                        // typed line. Keeps `echo "" | rmenu -p …` prompt-style
-                        // scripts working (they type an answer with no list).
-                        None => Done::Select(self.query.clone()),
-                    })
+            // Ctrl-Return: pick the highlighted entry, print it, and keep the
+            // menu open so scripts can multi-select (App emits `picked` after
+            // this call); advance so repeated presses walk the list.
+            Keysym::Return | Keysym::KP_Enter if mods.ctrl => {
+                self.picked.push(self.pick_value(items));
+                if self.sel + 1 < self.matches.len() {
+                    self.sel += 1;
                 }
             }
+            // Shift-Return: submit exactly what's typed, matches or not.
+            Keysym::Return | Keysym::KP_Enter if mods.shift => {
+                self.done = Some(Done::Select(self.query.clone()));
+            }
+            Keysym::Return | Keysym::KP_Enter => self.enter(items),
             Keysym::BackSpace => {
                 if self.query.pop().is_some() {
                     self.refilter(items, ci);
@@ -263,6 +300,14 @@ impl MenuState {
                     self.sel += 1;
                 }
             }
+            Keysym::Page_Up => {
+                self.sel = self.sel.saturating_sub(visible.max(1));
+            }
+            Keysym::Page_Down => {
+                self.sel = (self.sel + visible.max(1)).min(self.matches.len().saturating_sub(1));
+            }
+            Keysym::Home => self.sel = 0,
+            Keysym::End => self.sel = self.matches.len().saturating_sub(1),
             Keysym::Tab => {
                 // dmenu habit: complete the highlighted item into the query.
                 if let Some(&i) = self.matches.get(self.sel) {
@@ -279,12 +324,40 @@ impl MenuState {
                 }
             }
             _ => {
+                // xkb encodes ctrl+key as a single control char (ctrl+a -> U+0001).
+                // Bind the chords we support; everything else must not become
+                // query text (the old guard dropped them silently).
                 if let Some(t) = utf8 {
-                    // xkb encodes ctrl+key as a control char (ctrl+a -> U+0001);
-                    // never let those become query text.
-                    if !t.is_empty() && !t.chars().any(char::is_control) {
-                        self.query.push_str(&t);
-                        self.refilter(items, ci);
+                    match t.chars().next() {
+                        Some('\u{3}') | Some('\u{7}') => self.done = Some(Done::Cancel), // C-c / C-g
+                        Some('\u{8}') => {
+                            // C-h = backspace
+                            if self.query.pop().is_some() {
+                                self.refilter(items, ci);
+                            }
+                        }
+                        Some('\u{a}') | Some('\u{d}') => self.enter(items), // C-j / C-m = Return
+                        Some('\u{15}') => {
+                            // C-u: delete everything left of the caret (end of line)
+                            if !self.query.is_empty() {
+                                self.query.clear();
+                                self.refilter(items, ci);
+                            }
+                        }
+                        Some('\u{17}') => {
+                            // C-w: kill the last word and its separator (readline
+                            // style). Caret is at the end — no cursor support yet.
+                            let end = self.query.trim_end_matches(' ').len();
+                            let start = self.query[..end].rfind(' ').unwrap_or(0);
+                            self.query.truncate(start);
+                            self.refilter(items, ci);
+                        }
+                        _ => {
+                            if !t.is_empty() && !t.chars().any(char::is_control) {
+                                self.query.push_str(&t);
+                                self.refilter(items, ci);
+                            }
+                        }
                     }
                 }
             }
@@ -304,6 +377,9 @@ struct App {
     pool: SlotPool,
     qh: QueueHandle<App>,
     keyboard: Option<wl_keyboard::WlKeyboard>,
+    /// Latest modifier state; sctk drops modifiers from KeyEvent, so
+    /// `update_modifiers` is the only place they arrive.
+    mods: Modifiers,
     items: Vec<items::Item>,
     menu: MenuState,
     top: usize,
@@ -334,8 +410,27 @@ impl App {
     }
 
     fn on_key(&mut self, keysym: Keysym, utf8: Option<String>) {
-        self.menu.on_key(keysym, utf8, &self.items, self.ci);
+        let visible = self.visible();
+        self.menu.on_key(keysym, utf8, self.mods, &self.items, self.ci, visible);
+        // Ctrl-Return multi-select: emit each pick while the menu keeps running.
+        let picked = std::mem::take(&mut self.menu.picked);
+        for v in picked {
+            if self.run {
+                self.launch(&v);
+            } else {
+                println!("{v}");
+            }
+        }
         self.request_draw();
+    }
+
+    /// Spawn a `--run` selection via sh (selections are shell command lines).
+    fn launch(&self, cmd: &str) {
+        let _ = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(cmd)
+            .stdin(std::process::Stdio::null())
+            .spawn();
     }
 
     fn request_draw(&mut self) {
@@ -412,11 +507,7 @@ impl App {
         match self.menu.done.take() {
             Some(Done::Select(value)) => {
                 if self.run {
-                    let _ = std::process::Command::new("sh")
-                        .arg("-c")
-                        .arg(&value)
-                        .stdin(std::process::Stdio::null())
-                        .spawn();
+                    self.launch(&value);
                     exit(0);
                 }
                 println!("{value}");
@@ -588,10 +679,11 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        _: Modifiers,
+        modifiers: Modifiers,
         _: RawModifiers,
         _: u32,
     ) {
+        self.mods = modifiers;
     }
 }
 
@@ -628,12 +720,26 @@ mod tests {
     fn sample_items() -> Vec<items::Item> {
         ["firefox", "alacritty", "libreoffice"]
             .iter()
-            .map(|s| items::Item { text: s.to_string(), value: s.to_string() })
+            .map(|s| items::Item { lc: s.to_lowercase(), text: s.to_string(), value: s.to_string() })
             .collect()
     }
 
     fn opts(args: &[&str]) -> Opts {
         parse_opts_from(args.iter().map(|s| s.to_string()))
+    }
+
+    fn mods(ctrl: bool, shift: bool) -> Modifiers {
+        Modifiers { ctrl, shift, ..Default::default() }
+    }
+
+    /// Key press with default modifiers; `visible=3` mirrors the 3-item sample list.
+    fn key(m: &mut MenuState, items: &[items::Item], ks: Keysym, u: Option<&str>) {
+        m.on_key(ks, u.map(String::from), Modifiers::default(), items, false, 3);
+    }
+
+    /// xkeysym for any printable 'F' key; the `_` arm only uses the utf8 text.
+    fn type_key(m: &mut MenuState, items: &[items::Item], c: char) {
+        key(m, items, Keysym::from(0x66u32), Some(&c.to_string()));
     }
 
     #[test]
@@ -656,17 +762,12 @@ mod tests {
         assert!(!d.bottom && !d.password);
     }
 
-    /// xkeysym for any printable 'F' key; the `_` arm only uses the utf8 text.
-    fn type_key(m: &mut MenuState, items: &[items::Item], c: char) {
-        m.on_key(Keysym::from(0x66u32), Some(c.to_string()), items, false);
-    }
-
     #[test]
     fn escape_cancels() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         assert!(m.done.is_none());
-        m.on_key(Keysym::Escape, None, &items, false);
+        key(&mut m, &items, Keysym::Escape, None);
         assert_eq!(m.done, Some(Done::Cancel));
     }
 
@@ -675,7 +776,7 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'f'); // narrows to firefox + libreoffice, firefox first
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("firefox".into())));
     }
 
@@ -683,7 +784,7 @@ mod tests {
     fn enter_with_empty_query_cancels() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Cancel));
     }
 
@@ -694,7 +795,7 @@ mod tests {
         type_key(&mut m, &items, 'l');
         type_key(&mut m, &items, 'i');
         assert_eq!(m.matches.len(), 1);
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
     }
 
@@ -706,17 +807,18 @@ mod tests {
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'z');
         assert!(m.matches.is_empty());
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("z".into())));
     }
 
     #[test]
-    fn ctrl_chords_do_not_garbble_query() {
-        // Wayland hands ctrl+a .. ctrl+z to us as U+0001..U+001A control chars.
+    fn unbound_ctrl_chords_do_not_garbble_query() {
+        // Wayland hands ctrl+a .. ctrl+z to us as U+0001..U+001A control chars;
+        // unbound chords (C-a, C-v) must still never become query text.
         let items = sample_items();
         let mut m = MenuState::new(items.len());
-        m.on_key(Keysym::from(0x61u32), Some("\u{1}".into()), &items, false);
-        m.on_key(Keysym::from(0x76u32), Some("\u{16}".into()), &items, false);
+        m.on_key(Keysym::from(0x61u32), Some("\u{1}".into()), mods(true, false), &items, false, 3);
+        m.on_key(Keysym::from(0x76u32), Some("\u{16}".into()), mods(true, false), &items, false, 3);
         assert_eq!(m.query, "");
         assert_eq!(m.matches.len(), 3);
     }
@@ -727,7 +829,7 @@ mod tests {
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'a'); // only "alacritty"
         assert_eq!(m.matches.len(), 1);
-        m.on_key(Keysym::BackSpace, None, &items, false);
+        key(&mut m, &items, Keysym::BackSpace, None);
         assert_eq!(m.matches.len(), 3);
     }
 
@@ -736,15 +838,127 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'i'); // matches all three, original order (no prefix hit)
-        m.on_key(Keysym::Up, None, &items, false); // clamp at top
+        key(&mut m, &items, Keysym::Up, None); // clamp at top
         assert_eq!(m.sel, 0);
-        m.on_key(Keysym::Down, None, &items, false);
+        key(&mut m, &items, Keysym::Down, None);
         assert_eq!(m.sel, 1);
-        m.on_key(Keysym::Down, None, &items, false);
-        m.on_key(Keysym::Down, None, &items, false); // clamp at bottom
+        key(&mut m, &items, Keysym::Down, None);
+        key(&mut m, &items, Keysym::Down, None); // clamp at bottom
         assert_eq!(m.sel, 2);
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn page_keys_jump_by_visible_rows() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        m.on_key(Keysym::Page_Down, None, mods(false, false), &items, false, 2);
+        assert_eq!(m.sel, 2); // clamped to last (3 items, page 2)
+        m.on_key(Keysym::Page_Up, None, mods(false, false), &items, false, 2);
+        assert_eq!(m.sel, 0);
+        m.on_key(Keysym::Page_Up, None, mods(false, false), &items, false, 2); // clamp at top
+        assert_eq!(m.sel, 0);
+    }
+
+    #[test]
+    fn home_end_jump_selection() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        key(&mut m, &items, Keysym::Down, None);
+        key(&mut m, &items, Keysym::Home, None);
+        assert_eq!(m.sel, 0);
+        key(&mut m, &items, Keysym::End, None);
+        assert_eq!(m.sel, 2);
+        key(&mut m, &items, Keysym::End, None); // clamp
+        assert_eq!(m.sel, 2);
+    }
+
+    #[test]
+    fn ctrl_c_cancels() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'a');
+        m.on_key(Keysym::from(0x63u32), Some("\u{3}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.done, Some(Done::Cancel));
+    }
+
+    #[test]
+    fn ctrl_u_clears_query() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'f');
+        m.on_key(Keysym::from(0x75u32), Some("\u{15}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.query, "");
+        assert_eq!(m.matches.len(), 3);
+    }
+
+    #[test]
+    fn ctrl_w_kills_last_word_readline_style() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        for c in ['a', 'b', ' ', 'c', 'd'] {
+            type_key(&mut m, &items, c); // "ab cd"
+        }
+        m.on_key(Keysym::from(0x77u32), Some("\u{17}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.query, "ab");
+    }
+
+    #[test]
+    fn ctrl_w_on_trailing_space_kills_word_and_separator() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        for c in ['a', 'b', ' ', 'c', 'd', ' '] {
+            type_key(&mut m, &items, c); // "ab cd "
+        }
+        m.on_key(Keysym::from(0x77u32), Some("\u{17}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.query, "ab");
+    }
+
+    #[test]
+    fn ctrl_h_backspaces() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'l');
+        m.on_key(Keysym::from(0x68u32), Some("\u{8}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.query, "");
+        assert_eq!(m.matches.len(), 3);
+    }
+
+    #[test]
+    fn ctrl_j_enters_like_return() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'l'); // libreoffice
+        m.on_key(Keysym::from(0x6au32), Some("\u{a}".into()), mods(true, false), &items, false, 3);
+        assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn shift_return_submits_typed_text() {
+        // Even with matches available, Shift-Return submits exactly the typed line.
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'i'); // matches all three, sel=0 (firefox)
+        m.on_key(Keysym::Return, None, mods(false, true), &items, false, 3);
+        assert_eq!(m.done, Some(Done::Select("i".into())));
+    }
+
+    #[test]
+    fn ctrl_return_picks_and_continues() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'i'); // all three match, sel=0 -> firefox
+        let ctrl = mods(true, false);
+        m.on_key(Keysym::Return, None, ctrl, &items, false, 3);
+        assert_eq!(m.picked, vec!["firefox".to_string()]);
+        assert!(m.done.is_none());
+        assert_eq!(m.sel, 1); // advanced so repeated Ctrl-Return walks the list
+        m.on_key(Keysym::Return, None, ctrl, &items, false, 3);
+        assert_eq!(m.sel, 2);
+        m.on_key(Keysym::Return, None, ctrl, &items, false, 3);
+        assert_eq!(m.sel, 2); // clamps at last
+        assert_eq!(m.picked, vec!["firefox".to_string(), "alacritty".to_string(), "libreoffice".to_string()]);
     }
 
     #[test]
@@ -752,12 +966,12 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'o'); // matches: firefox, libreoffice
-        m.on_key(Keysym::Down, None, &items, false); // highlight libreoffice (2nd match)
-        m.on_key(Keysym::Tab, None, &items, false);
+        key(&mut m, &items, Keysym::Down, None); // highlight libreoffice (2nd match)
+        key(&mut m, &items, Keysym::Tab, None);
         assert_eq!(m.query, "libreoffice");
         assert_eq!(m.matches.len(), 1); // refiltered to the completed item
         assert_eq!(m.sel, 0);
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
     }
 
@@ -767,9 +981,9 @@ mod tests {
         // selection still exists — Tab fills it like any other state.
         let items = sample_items();
         let mut m = MenuState::new(items.len());
-        m.on_key(Keysym::Tab, None, &items, false);
+        key(&mut m, &items, Keysym::Tab, None);
         assert_eq!(m.query, "firefox");
-        m.on_key(Keysym::Return, None, &items, false);
+        key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("firefox".into())));
     }
 
@@ -778,7 +992,7 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'z'); // no matches
-        m.on_key(Keysym::Tab, None, &items, false);
+        key(&mut m, &items, Keysym::Tab, None);
         assert_eq!(m.query, "z");
         assert!(m.matches.is_empty());
     }

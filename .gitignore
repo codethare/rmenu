@@ -24,3 +24,9 @@ target
 # Added by cargo
 
 /target
+
+# pi agent cache/artifacts (local only)
+.pi/
+openspec/
+.codegraph/
+tasks/

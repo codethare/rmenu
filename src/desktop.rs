@@ -6,10 +6,9 @@ use std::path::{Path, PathBuf};
 pub struct App {
     pub name: String,
     pub exec: String,
-    pub icon: Option<String>,
 }
 
-const CHECK_KEYS: &[&str] = &["Name", "Icon", "Exec", "NoDisplay", "Hidden"];
+const CHECK_KEYS: &[&str] = &["Name", "Exec", "NoDisplay", "Hidden"];
 
 /// All application directories per the freedesktop spec, lowest to highest priority.
 pub fn app_dirs() -> Vec<PathBuf> {
@@ -61,7 +60,6 @@ fn parse_desktop(path: &Path) -> Option<App> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut in_entry = false;
     let mut name = None;
-    let mut icon = None;
     let mut exec = None;
     let mut no_display = false;
     let mut hidden = false;
@@ -80,7 +78,6 @@ fn parse_desktop(path: &Path) -> Option<App> {
         }
         match key {
             "Name" => name = Some(value.to_string()),
-            "Icon" => icon = Some(value.to_string()),
             "Exec" => exec = Some(value.to_string()),
             "NoDisplay" => no_display = value == "true",
             "Hidden" => hidden = value == "true",
@@ -90,11 +87,7 @@ fn parse_desktop(path: &Path) -> Option<App> {
     if no_display || hidden {
         return None;
     }
-    Some(App {
-        name: name?,
-        exec: clean_exec(exec.as_deref()?),
-        icon: icon.filter(|i| !i.is_empty()),
-    })
+    Some(App { name: name?, exec: clean_exec(exec.as_deref()?) })
 }
 
 /// Strip trailing field codes (e.g. `%F %u`) from an Exec line.
@@ -130,16 +123,16 @@ fn is_executable(p: &Path) -> bool {
 }
 
 /// Merge desktop apps and PATH commands into menu items: apps win on name
-/// collision (case-insensitive), result sorted by name. Commands carry no icon.
+/// collision (case-insensitive), result sorted by name.
 pub fn merged(apps: Vec<App>, cmds: Vec<String>) -> Vec<crate::items::Item> {
     let mut items: Vec<crate::items::Item> = apps
         .into_iter()
-        .map(|a| crate::items::Item { icon: a.icon, text: a.name, value: a.exec })
+        .map(|a| crate::items::Item { lc: a.name.to_lowercase(), text: a.name, value: a.exec })
         .collect();
     let mut seen: HashSet<String> = items.iter().map(|i| i.text.to_lowercase()).collect();
     for cmd in cmds {
         if seen.insert(cmd.to_lowercase()) {
-            items.push(crate::items::Item { icon: None, text: cmd.clone(), value: cmd });
+            items.push(crate::items::Item { lc: cmd.to_lowercase(), text: cmd.clone(), value: cmd });
         }
     }
     items.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()));
@@ -153,15 +146,14 @@ mod tests {
     #[test]
     fn merge_apps_and_commands_dedups_by_name() {
         let apps = vec![
-            App { name: "Firefox".into(), exec: "firefox %u".into(), icon: Some("firefox".into()) },
-            App { name: "Zathura".into(), exec: "zathura %f".into(), icon: None },
+            App { name: "Firefox".into(), exec: "firefox %u".into() },
+            App { name: "Zathura".into(), exec: "zathura %f".into() },
         ];
         let cmds = vec!["firefox".to_string(), "alacritty".to_string(), "zathura".to_string()];
         let items = merged(apps, cmds);
         let names: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
-        // deduped, sorted, desktop entry (icon) wins over the bare command
+        // deduped, sorted, desktop entry wins over the bare command
         assert_eq!(names, vec!["alacritty", "Firefox", "Zathura"]);
-        assert!(items[1].icon.is_some() && items[2].icon.is_none());
     }
 
     #[test]
@@ -198,7 +190,6 @@ mod legacy_tests {
         let app = parse_desktop(&df).expect("parses");
         assert_eq!(app.name, "Test 应用");
         assert_eq!(app.exec, "test-app --flag");
-        assert_eq!(app.icon.as_deref(), Some("org.test.App"));
 
         std::fs::write(&df, "[Desktop Entry]\nType=Application\nName=Hide Me\nNoDisplay=true\n").unwrap();
         assert!(parse_desktop(&df).is_none());

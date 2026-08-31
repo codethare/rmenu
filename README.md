@@ -12,9 +12,12 @@ the whole UI is drawn by `ab_glyph`.
 
 - wmenu/dmenu-style filtering: every space-separated query token must be a
   substring; ranking is exact > prefix > substring
-- `Ctrl`-free text input, `Up`/`Down` navigation, key repeat, long-list
-  scrolling, case-insensitive matching (`-i`), `Tab` completes the highlighted
-  entry into the input
+- `Ctrl`-free text input, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` navigation, key
+  repeat, long-list scrolling, case-insensitive matching (`-i`), `Tab` completes
+  the highlighted entry into the input; `Ctrl-c`/`Ctrl-g` cancel, `Ctrl-h`
+  backspace, `Ctrl-j`/`Ctrl-m` accept, `Ctrl-u` clears the line, `Ctrl-w` kills
+  the last word, `Shift-Return` submits exactly what was typed, and
+  `Ctrl-Return` multi-selects (prints each pick, keeps running)
 - Spotlight-style UI: rounded corners; launch shows only the input bar in the
   upper-center of the screen, results appear as you type, and the menu
   collapses back to the bar when the query is cleared
@@ -44,7 +47,8 @@ printf 'alacritty\nfirefox\n' | rmenu -i -p 'run: '
 
 Options (wmenu-compatible subset): `-b` (menu at screen bottom), `-P` (mask typed
 input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W width`,
-`-p prompt`, `-f font.ttf`, `-v` (print version), `--run`, `-h`.
+`-p prompt`, `-f font.ttf|"FAMILY [style] [pt|Npx]"` (bare size is points, `Npx` is
+pixels — wmenu/Pango convention), `-v` (print version), `--run`, `-h`.
 
 Colors are wmenu-style `RRGGBB[AA]`: `-N` normal bg, `-n` normal fg, `-M` prompt bg,
 `-m` prompt fg, `-S` selection bg, `-s` selection fg. Example:
