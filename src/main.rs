@@ -344,6 +344,18 @@ impl MenuState {
                                 self.refilter(items, ci);
                             }
                         }
+                        Some('\u{e}') => {
+                            // C-n: next row
+                            if self.sel + 1 < self.matches.len() {
+                                self.sel += 1;
+                            }
+                        }
+                        Some('\u{10}') => {
+                            // C-p: previous row
+                            if self.sel > 0 {
+                                self.sel -= 1;
+                            }
+                        }
                         Some('\u{17}') => {
                             // C-w: kill the last word and its separator (readline
                             // style). Caret is at the end — no cursor support yet.
@@ -847,6 +859,22 @@ mod tests {
         assert_eq!(m.sel, 2);
         key(&mut m, &items, Keysym::Return, None);
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
+    }
+
+    #[test]
+    fn ctrl_n_p_move_selection() {
+        let items = sample_items();
+        let mut m = MenuState::new(items.len());
+        type_key(&mut m, &items, 'i'); // all three matches
+        m.on_key(Keysym::from(0x70u32), Some("\u{10}".into()), mods(true, false), &items, false, 3); // C-p clamp at top
+        assert_eq!(m.sel, 0);
+        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3); // C-n
+        assert_eq!(m.sel, 1);
+        m.on_key(Keysym::from(0x70u32), Some("\u{10}".into()), mods(true, false), &items, false, 3); // C-p
+        assert_eq!(m.sel, 0);
+        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3);
+        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3); // C-n clamp at bottom
+        assert_eq!(m.sel, 2);
     }
 
     #[test]

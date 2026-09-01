@@ -18,6 +18,9 @@ pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
 /// separate pieces of one panel.
 pub const BG_PROMPT: Bgra = bgra(0x2e, 0x2e, 0x2e, 0xff);
 pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
+/// Prompt label strip: sits only behind the prompt text (e.g. "address"), so
+/// the label reads apart from the input content area (which stays `bg_prompt`).
+pub const BG_LABEL: Bgra = bgra(0x00, 0x45, 0x60, 0xff);
 pub const BG_SEL: Bgra = bgra(0x00, 0x55, 0x77, 0xff);
 pub const FG_SEL: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 
@@ -30,6 +33,8 @@ pub struct Colors {
     pub fg_normal: Bgra,
     /// Prompt/input row background (`-M`).
     pub bg_prompt: Bgra,
+    /// Prompt label strip background (input bar stays `bg_prompt`).
+    pub bg_label: Bgra,
     /// Prompt/input row foreground (`-m`).
     pub fg_prompt: Bgra,
     /// Selected row background (`-S`).
@@ -44,6 +49,7 @@ impl Default for Colors {
             bg_normal: BG_NORMAL,
             fg_normal: FG_NORMAL,
             bg_prompt: BG_PROMPT,
+            bg_label: BG_LABEL,
             fg_prompt: FG_PROMPT,
             bg_sel: BG_SEL,
             fg_sel: FG_SEL,
@@ -127,7 +133,17 @@ pub fn draw(
 
     // Prompt / input row text.
     let baseline = row_baseline(font, 0);
-    let mut x = draw_text(buf, w, h, font, p as f32, baseline, prompt, colors.fg_prompt, (w - 2 * p) as f32);
+    // The prompt label ("address") gets a distinct background strip, clipped to
+    // the rounded outline like the selection band below.
+    let mut x = p as f32;
+    if !prompt.is_empty() {
+        let label_end = (p + measure(font, prompt, (w - 2 * p) as f32) as u32).min(w);
+        for yy in 0..row_h.min(h) {
+            let (x0, x1) = rounded_span(w, h, r, yy);
+            set_span(buf, w, yy, x0, x1.min(label_end), colors.bg_label);
+        }
+        x = draw_text(buf, w, h, font, p as f32, baseline, prompt, colors.fg_prompt, (w - 2 * p) as f32);
+    }
     if !query.is_empty() {
         x = draw_text(buf, w, h, font, x, baseline, &query, colors.fg_prompt, w as f32 - x - p as f32);
     }
@@ -229,6 +245,30 @@ pub fn draw_text(
             continue 'ch;
         }
         // No face in the chain has this glyph; skip it silently.
+    }
+    cx
+}
+
+/// Advance width of `s` under the same face-chain + fit rules as `draw_text`
+/// (returns the extent starting at 0, capped at `max_w`). Kept in lockstep
+/// with `draw_text`'s per-glyph fit break.
+fn measure(font: &crate::font::MenuFont, s: &str, max_w: f32) -> f32 {
+    let scale = || PxScale::from(font.size);
+    let mut cx = 0.0;
+    'ch: for ch in s.chars() {
+        for face in std::iter::once(&font.font).chain(font.fallbacks.iter()) {
+            let scaled = face.as_scaled(scale());
+            let gid = scaled.glyph_id(ch);
+            if gid == GlyphId(0) {
+                continue;
+            }
+            let adv = scaled.h_advance(gid);
+            if cx + adv > max_w {
+                break 'ch;
+            }
+            cx += adv;
+            continue 'ch;
+        }
     }
     cx
 }
@@ -371,6 +411,29 @@ mod tests {
         // Input bar row uses bg_prompt, the list row below it bg_normal.
         assert_eq!(px(w / 2, 2), &def.bg_prompt);
         assert_eq!(px(w / 2, font.row_h + 2), &def.bg_normal);
+    }
+
+    #[test]
+    fn prompt_label_has_distinct_background_from_input_area() {
+        let def = Colors::default();
+        assert_ne!(def.bg_label, def.bg_prompt, "label strip must differ from input area");
+
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (240u32, font.row_h);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        draw(&mut buf, w, h, &font, "address", "", false, &[], crate::PAD, &def);
+        let mid = font.row_h / 2;
+        let px = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
+        // Behind the prompt text: label strip; right of it: input bar color.
+        assert_eq!(px(crate::PAD), &def.bg_label);
+        let label_end = crate::PAD + measure(&font, "address", (w - 2 * crate::PAD) as f32) as u32;
+        // +8 clears any antialiased bleed past the last glyph's advance.
+        assert_eq!(px(label_end + 8), &def.bg_prompt);
+
+        // Empty prompt → no strip; the whole bar stays bg_prompt.
+        let mut buf2 = vec![0u8; (w * h * 4) as usize];
+        draw(&mut buf2, w, h, &font, "", "x", false, &[], crate::PAD, &def);
+        assert_eq!(&buf2[((mid * w + crate::PAD) * 4) as usize..][..4], &def.bg_prompt);
     }
 
     #[test]

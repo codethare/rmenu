@@ -2,6 +2,7 @@
 //! (CJK-capable preferred so Chinese labels render).
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use std::path::{Path, PathBuf};
 #[cfg(test)]
 use ab_glyph::GlyphId;
 
@@ -31,23 +32,28 @@ impl MenuFont {
             }
         }
 
-        let chain = system_chain();
-        let (data, index, size) = match spec {
+        let chain = cached_system_chain();
+        let (bytes, index, size) = match spec {
             Some(s) => resolve_family(s, size)?,
             None => {
-                let (data, index) =
+                let (path, index) =
                     chain.first().cloned().ok_or("no usable system font found".to_string())?;
-                (data, index, size)
+                let bytes =
+                    std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                (bytes, index, size)
             }
         };
-        let font = FontVec::try_from_vec_and_index(data, index)
+        let font = FontVec::try_from_vec_and_index(bytes, index)
             .map_err(|e| format!("invalid font: {e}"))?;
         // With no `-f` the chain's head is the primary; skip it in the fallbacks.
         let skip = usize::from(spec.is_none());
         let fallbacks: Vec<FontVec> = chain
             .into_iter()
             .skip(skip)
-            .filter_map(|(d, i)| FontVec::try_from_vec_and_index(d, i).ok())
+            .filter_map(|(path, i)| {
+                let bytes = std::fs::read(path).ok()?;
+                FontVec::try_from_vec_and_index(bytes, i).ok()
+            })
             .collect();
         Ok(Self::build(font, fallbacks, size))
     }
@@ -140,14 +146,14 @@ fn query_family(family: &str, weight: fontdb::Weight) -> Option<(Vec<u8>, u32)> 
         .and_then(|id| copy_face(&db, id))
 }
 
-/// CJK-preferring ordered list of usable system faces (primary candidate first),
-/// used both for auto-pick and as the fallback chain.
-fn system_chain() -> Vec<(Vec<u8>, u32)> {
+/// CJK-preferring ordered list of usable system font paths (primary candidate
+/// first), used both for auto-pick and as the fallback chain.
+fn system_chain() -> Vec<(PathBuf, u32)> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     // CJK list: mutual alternates, not complements. One face covers all CJK +
     // kana glyphs, and SC/TC/JP are usually faces of the same ~20MB TTC — so
-    // take the first hit and stop instead of copying the TTC once per region.
+    // take the first hit and stop.
     const CJK: &[&str] = &[
         "Noto Sans CJK SC",
         "Noto Sans CJK TC",
@@ -158,30 +164,170 @@ fn system_chain() -> Vec<(Vec<u8>, u32)> {
     const MONO: &[&str] = &["Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"];
     let mut out = Vec::new();
     for fam in CJK {
-        if let Some(found) = query_copy(&db, fam) {
+        if let Some(found) = query_path(&db, fam) {
             out.push(found);
             break;
         }
     }
     for fam in MONO {
-        if let Some(found) = query_copy(&db, fam) {
+        if let Some(found) = query_path(&db, fam) {
             out.push(found);
+        }
+    }
+    // Nerd Font PUA icons (patched families / "Symbols Nerd Font"): the mono
+    // and CJK faces never carry -style glyphs, so a face whose family mentions
+    // "Nerd Font" joins the chain to resolve them.
+    for face in db.faces() {
+        if face.families.iter().any(|f| f.0.to_ascii_lowercase().contains("nerd font"))
+            && let Some(found) = face_path(&db, face.id)
+        {
+            out.push(found);
+            break;
         }
     }
     if out.is_empty() {
         // Give up on family preference: just take the first face so the menu still renders.
-        if let Some(face) = db.faces().next() {
-            if let Some(found) = copy_face(&db, face.id) {
-                out.push(found);
-            }
+        if let Some(face) = db.faces().next()
+            && let Some(found) = face_path(&db, face.id)
+        {
+            out.push(found);
         }
     }
     out
 }
 
-fn query_copy(db: &fontdb::Database, family: &str) -> Option<(Vec<u8>, u32)> {
+fn query_path(db: &fontdb::Database, family: &str) -> Option<(PathBuf, u32)> {
     let id = db.query(&fontdb::Query { families: &[fontdb::Family::Name(family)], ..Default::default() })?;
-    copy_face(db, id)
+    face_path(db, id)
+}
+
+fn face_path(db: &fontdb::Database, id: fontdb::ID) -> Option<(PathBuf, u32)> {
+    let face = db.face(id)?;
+    let path = match &face.source {
+        fontdb::Source::File(p) | fontdb::Source::SharedFile(p, _) => p.clone(),
+        fontdb::Source::Binary(_) => return None,
+    };
+    Some((path, face.index))
+}
+
+/// Persistent cache of the resolved system chain, so the ~100ms fontdb scan
+/// (it parses every installed font header on each launch; on this box that is
+/// 2193 files / 756MB) only runs when fonts actually change. Keyed on the
+/// standard font dirs' mtimes — the same trick as fontconfig's fc-cache.
+/// ponytail: dirs from a custom /etc/fonts/fonts.conf aren't keyed, so chain
+/// changes there go unnoticed until a keyed dir changes; `-f FAMILY` rescans anyway.
+fn cached_system_chain() -> Vec<(PathBuf, u32)> {
+    let (Some(key), Some(path)) = (cache_key(), cache_path()) else {
+        return system_chain(); // no XDG_CACHE_HOME/HOME — scan every launch
+    };
+    if let Some(chain) = read_cache(&path, &key)
+        && chain.iter().all(|(p, _)| p.exists())
+    {
+        return chain;
+    }
+    let chain = system_chain();
+    write_cache(&path, &key, &chain);
+    chain
+}
+
+/// Standard user/system font dirs (fontdb's no-fontconfig scan list); their
+/// mtimes are the cache key. A font added/removed touches the dir mtime.
+fn cache_key() -> Option<Vec<(PathBuf, std::time::SystemTime)>> {
+    let mut dirs = Vec::new();
+    if let Some(h) = std::env::var_os("XDG_DATA_HOME") {
+        dirs.push(PathBuf::from(h).join("fonts"));
+    } else if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join(".fonts"));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        dirs.push(PathBuf::from(h).join(".local/share/fonts"));
+    }
+    dirs.push(PathBuf::from("/usr/local/share/fonts"));
+    dirs.push(PathBuf::from("/usr/share/fonts"));
+    let key: Vec<_> = dirs
+        .into_iter()
+        .filter_map(|d| Some((d.clone(), std::fs::metadata(&d).ok()?.modified().ok()?)))
+        .collect();
+    if key.is_empty() {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+fn cache_path() -> Option<PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
+    Some(base.join("rmenu").join("font-chain"))
+}
+
+fn mtime_parts(t: std::time::SystemTime) -> (u64, u32) {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => (d.as_secs(), d.subsec_nanos()),
+        Err(_) => (0, 0), // pre-epoch clock: constant key
+    }
+}
+
+/// `None` = cache missing, unparsable, or keyed to different fonts.
+fn read_cache(path: &Path, key: &[(PathBuf, std::time::SystemTime)]) -> Option<Vec<(PathBuf, u32)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "rmenu-font-cache v1" {
+        return None;
+    }
+    for (dir, mt) in key {
+        let mut it = lines.next()?.splitn(4, '\t');
+        let (tag, d, s, n) = (
+            it.next()?,
+            it.next()?,
+            it.next()?.parse::<u64>().ok()?,
+            it.next()?.parse::<u32>().ok()?,
+        );
+        if tag != "d" || d != dir.to_str()? || (s, n) != mtime_parts(*mt) {
+            return None;
+        }
+    }
+    let mut chain = Vec::new();
+    for line in lines {
+        let mut it = line.splitn(3, '\t');
+        if it.next()? != "f" {
+            return None;
+        }
+        let index: u32 = it.next()?.parse().ok()?;
+        chain.push((PathBuf::from(it.next()?), index));
+    }
+    if chain.is_empty() {
+        return None;
+    }
+    Some(chain)
+}
+
+/// Best-effort: any I/O failure just means the next launch rescans.
+fn write_cache(path: &Path, key: &[(PathBuf, std::time::SystemTime)], chain: &[(PathBuf, u32)]) {
+    if chain.is_empty() {
+        return;
+    }
+    let mut text = String::from("rmenu-font-cache v1\n");
+    for (dir, mt) in key {
+        let Some(d) = dir.to_str() else { return };
+        let (s, n) = mtime_parts(*mt);
+        text.push_str(&format!("d\t{d}\t{s}\t{n}\n"));
+    }
+    for (p, i) in chain {
+        let Some(p) = p.to_str() else { return };
+        if p.contains('\n') {
+            return;
+        }
+        text.push_str(&format!("f\t{i}\t{p}\n"));
+    }
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("tmp");
+    if std::fs::write(&tmp, text).is_ok() {
+        let _ = std::fs::rename(&tmp, path); // atomic: never serve a torn cache
+    }
 }
 
 fn copy_face(db: &fontdb::Database, id: fontdb::ID) -> Option<(Vec<u8>, u32)> {
@@ -254,15 +400,59 @@ mod tests {
     #[test]
     fn chain_takes_one_cjk_face_only() {
         // SC/TC/JP/文泉驿/思源 are alternates, not complements (usually faces of
-        // the same ~20MB TTC): the chain must never hold more than one big copy.
+        // the same ~20MB TTC): the chain must never hold more than one big face.
+        // Threshold is above any nerd-font/mono face (<8MB) but below a CJK TTC.
         let chain = system_chain();
-        let big: Vec<usize> = chain
+        let big = chain
             .iter()
-            .enumerate()
-            .filter(|(_, (d, _))| d.len() > 1_000_000)
-            .map(|(i, _)| i)
-            .collect();
-        assert!(big.len() <= 1, "at most one large (CJK) face in chain: {big:?}");
+            .filter(|(p, _)| std::fs::metadata(p).map(|m| m.len() > 8_000_000).unwrap_or(false))
+            .count();
+        assert!(big <= 1, "at most one large (CJK) face in chain: {chain:?}");
+    }
+
+    #[test]
+    fn font_cache_round_trips_and_invalidates_on_key_change() {
+        let dir = std::env::temp_dir().join(format!("rmenu-cache-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let font = dir.join("a.ttf");
+        std::fs::write(&font, b"font").unwrap();
+        let path = dir.join("font-chain");
+        let key = vec![(font.clone(), std::fs::metadata(&font).unwrap().modified().unwrap())];
+        let chain = vec![(font.clone(), 3u32)];
+        write_cache(&path, &key, &chain);
+        assert_eq!(read_cache(&path, &key), Some(chain));
+        // A changed dir mtime (font added/removed) invalidates the cache.
+        let stale = vec![(
+            font.clone(),
+            std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
+        )];
+        assert_eq!(read_cache(&path, &stale), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn chain_renders_nerd_font_pua_icons() {
+        // Skip on systems without any Nerd Font (no PUA icons to draw anyway).
+        let mut db = fontdb::Database::new();
+        db.load_system_fonts();
+        let sample = db.faces().find_map(|f| {
+            if !f.families.iter().any(|f| f.0.to_ascii_lowercase().contains("nerd font")) {
+                return None;
+            }
+            db.with_face_data(f.id, |d, i| (d.to_vec(), i))
+                .and_then(|(d, i)| FontVec::try_from_vec_and_index(d, i).ok())
+        });
+        let Some(fv) = sample else { return };
+        // Pick one PUA codepoint the installed Nerd face actually covers.
+        let scaled = fv.as_scaled(PxScale::from(16.0));
+        let Some(cp) = (0xF000..=0xFDFF)
+            .find(|&cp| scaled.glyph_id(char::from_u32(cp).unwrap()) != GlyphId(0))
+        else { return };
+        let m = MenuFont::load(None, 16.0).expect("system font available");
+        assert!(
+            m.has_glyph(char::from_u32(cp).unwrap()),
+            "Nerd Font PUA glyph U+{cp:X} must resolve via the chain"
+        );
     }
 
     #[test]

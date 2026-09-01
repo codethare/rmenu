@@ -12,7 +12,7 @@ the whole UI is drawn by `ab_glyph`.
 
 - wmenu/dmenu-style filtering: every space-separated query token must be a
   substring; ranking is exact > prefix > substring
-- `Ctrl`-free text input, `Up`/`Down`/`PgUp`/`PgDn`/`Home`/`End` navigation, key
+- `Ctrl`-free text input, `Up`/`Down`/`Ctrl-n`/`Ctrl-p`/`PgUp`/`PgDn`/`Home`/`End` navigation, key
   repeat, long-list scrolling, case-insensitive matching (`-i`), `Tab` completes
   the highlighted entry into the input; `Ctrl-c`/`Ctrl-g` cancel, `Ctrl-h`
   backspace, `Ctrl-j`/`Ctrl-m` accept, `Ctrl-u` clears the line, `Ctrl-w` kills
@@ -22,8 +22,9 @@ the whole UI is drawn by `ab_glyph`.
   upper-center of the screen, results appear as you type, and the menu
   collapses back to the bar when the query is cleared
 - `--run` launcher mode: scans `.desktop` files and launches the selection
-  via `sh -c` — and merges in everything executable on `$PATH` (scripts
-  included), deduped with the desktop entries winning
+  via `sh -c` — and merges in everything on `$PATH`, deduped with the desktop
+  entries winning (like wmenu-run, files are listed by name — no per-entry
+  exec check, so non-executables may appear)
 - CJK text renders (auto-picks a CJK-capable system font)
 
 ## Build / run

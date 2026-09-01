@@ -1,0 +1,66 @@
+#!/usr/bin/sh
+# address - universal wayland address book manager with query and fuzzy find.
+# @depends $MENU wtype wl-clipboard cliphist
+# Also see `../.local/share/address/address.example`
+
+# This script has completions: `.config/{z,ba}sh/completions/_scripts.{z,ba}sh`
+#
+
+if [ -x "${HOME}/.local/bin/wmenu-color" ] && command -v wl-copy >/dev/null 2>&1; then
+    MENU="${HOME}/.local/bin/wmenu-color"
+    copy_cmd="wl-copy -t text/plain"
+else
+    MENU="dmenu"
+    copy_cmd="xsel -b"
+fi
+
+ADDRESS_BOOK_DIR="${HOME}/.local/share/address"
+ADDRESS_BOOK="${ADDRESS_BOOK_DIR}/address"
+menu_prompt="$(basename $0)"
+
+
+editAddress() {
+    $EDITOR $ADDRESS_BOOK
+}
+
+getAddress() {
+    cat $ADDRESS_BOOK | grep -vE "^#|^[[:space:]]*$" \
+        | $MENU -p "$menu_prompt" -l 10 \
+        | awk ' {sub(/[^|]*\|/, ""); print}'
+}
+
+# address for recording (with personal info censored)
+getAddressRecord() {
+    ADDRESS_BOOK="${ADDRESS_BOOK_DIR}/address-record"
+    menu_prompt="${menu_prompt}-record"
+    getAddress
+}
+
+# address with multiple lines (newline character)
+getAddressMulti() {
+    ADDRESS_BOOK="${ADDRESS_BOOK_DIR}/multi"
+    menu_prompt="${menu_prompt}-multi"
+    selected=$(ls "$ADDRESS_BOOK" | $MENU -p "$menu_prompt" -l 9 -i)
+    cat "${ADDRESS_BOOK}/${selected}"
+    exit 0
+}
+
+openInQutebrowser() {
+    url="$(getAddress)"
+    [ -z "$url" ] || qbz --target tab-bg-silent "$url"
+}
+
+openInQutebrowserRecord() {
+    url="$(getAddressRecord)"
+    [ -z "$url" ] || qbz --target tab-bg-silent "$url"
+}
+
+case "$1" in
+    -e|--edit) editAddress ;;
+    -r|--record) getAddressRecord | $copy_cmd ;;
+    -m|--multi) getAddressMulti | $copy_cmd ;;
+    -q|--qutebrowser) openInQutebrowser ;;
+    -Q|--qutebrowserRecord) openInQutebrowserRecord ;;
+    *) getAddress | $copy_cmd ;;
+esac
+

@@ -97,7 +97,9 @@ fn clean_exec(exec: &str) -> String {
     words[..end].join(" ")
 }
 
-/// Executables found in `$PATH` (scripts, binaries, symlinks), deduped by file name.
+/// Commands found in `$PATH`, deduped by file name. Like wmenu-run: listed by
+/// name only, no per-entry stat — non-executables may appear (launching one via
+/// sh just fails with "command not found").
 pub fn path_commands() -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
@@ -109,17 +111,10 @@ pub fn path_commands() -> Vec<String> {
             if name.starts_with('.') || !seen.insert(name.clone()) {
                 continue;
             }
-            if is_executable(&e.path()) {
-                out.push(name);
-            }
+            out.push(name);
         }
     }
     out
-}
-
-fn is_executable(p: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(p).map(|m| m.permissions().mode() & 0o111 != 0).unwrap_or(false)
 }
 
 /// Merge desktop apps and PATH commands into menu items: apps win on name
@@ -135,7 +130,7 @@ pub fn merged(apps: Vec<App>, cmds: Vec<String>) -> Vec<crate::items::Item> {
             items.push(crate::items::Item { lc: cmd.to_lowercase(), text: cmd.clone(), value: cmd });
         }
     }
-    items.sort_by(|a, b| a.text.to_lowercase().cmp(&b.text.to_lowercase()));
+    items.sort_by(|a, b| a.lc.cmp(&b.lc)); // lc precomputed at parse; no per-comparison lowercasing
     items
 }
 
