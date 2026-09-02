@@ -21,7 +21,7 @@ pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 /// Prompt label strip: sits only behind the prompt text (e.g. "address"), so
 /// the label reads apart from the input content area (which stays `bg_prompt`).
 pub const BG_LABEL: Bgra = bgra(0x00, 0x45, 0x60, 0xff);
-pub const BG_SEL: Bgra = bgra(0x00, 0x55, 0x77, 0xff);
+pub const BG_SEL: Bgra = bgra(0x0f, 0x7c, 0xa6, 0xff);
 pub const FG_SEL: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 
 /// Menu color scheme, wmenu-style (defaults match the old hardcoded constants).

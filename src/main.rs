@@ -10,6 +10,10 @@ mod render;
 
 use std::io::{self, BufRead};
 use std::process::exit;
+use std::time::Duration;
+
+use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 
 use smithay_client_toolkit::{
     compositor::{CompositorHandler, CompositorState, FrameCallbackData},
@@ -142,11 +146,22 @@ fn main() {
         eprintln!("rmenu: cannot connect to Wayland: {e}");
         exit(1);
     });
-    let (globals, mut event_queue) = registry_queue_init(&conn).unwrap_or_else(|e| {
+    let (globals, event_queue) = registry_queue_init(&conn).unwrap_or_else(|e| {
         eprintln!("rmenu: cannot init globals: {e}");
         exit(1);
     });
     let qh = event_queue.handle();
+    // calloop drives both the Wayland socket and sctk's key-repeat timer, so
+    // holding a key (C-p/C-n, arrows) auto-repeats at the compositor's rate.
+    let mut event_loop: EventLoop<App> = EventLoop::try_new().unwrap_or_else(|e| {
+        eprintln!("rmenu: {e}");
+        exit(1);
+    });
+    let loop_handle = event_loop.handle();
+    WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone()).unwrap_or_else(|e| {
+        eprintln!("rmenu: {e}");
+        exit(1);
+    });
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
@@ -194,9 +209,17 @@ fn main() {
         first_configure: true,
         run: opts.run,
         mods: Modifiers::default(),
+        loop_handle,
     };
 
-    while app.menu.done.is_none() && event_queue.blocking_dispatch(&mut app).is_ok() {}
+    loop {
+        if event_loop.dispatch(Duration::from_millis(16), &mut app).is_err() {
+            break;
+        }
+        if app.menu.done.is_some() {
+            break;
+        }
+    }
     app.finish();
 }
 
@@ -410,6 +433,7 @@ struct App {
     frame_pending: bool,
     first_configure: bool,
     run: bool,
+    loop_handle: smithay_client_toolkit::reexports::calloop::LoopHandle<'static, App>,
 }
 
 impl App {
@@ -616,7 +640,18 @@ impl SeatHandler for App {
         capability: Capability,
     ) {
         if capability == Capability::Keyboard && self.keyboard.is_none() {
-            self.keyboard = self.seat_state.get_keyboard(qh, &seat, None).ok();
+            // Route repeats through the calloop loop (the sctk repeat timer);
+            // with plain get_keyboard the repeat callback is never armed.
+            self.keyboard = self
+                .seat_state
+                .get_keyboard_with_repeat(
+                    qh,
+                    &seat,
+                    None,
+                    self.loop_handle.clone(),
+                    Box::new(|app, _kbd, event| app.on_key(event.keysym, event.utf8)),
+                )
+                .ok();
         }
     }
     fn remove_capability(
@@ -672,9 +707,9 @@ impl KeyboardHandler for App {
         _: &QueueHandle<Self>,
         _: &wl_keyboard::WlKeyboard,
         _: u32,
-        event: KeyEvent,
+        _: KeyEvent,
     ) {
-        self.on_key(event.keysym, event.utf8);
+        // Repeats are delivered via the get_keyboard_with_repeat callback, not here.
     }
     fn release_key(
         &mut self,
