@@ -8,3 +8,15 @@
 - [x] T1 font.rs + main.rs：行高 16→24px（上下各 4px，Fitts 目标扩大）、PAD 4→12（≥ 圆角半径 10，文字不蹭弧线）、顶边距 24→32（不与屏边贴死）
 - [x] T2 render.rs：修复 caret 被行高隐藏的潜在 bug（ab_glyph descent 为负，`baseline+descent` 算出错位/不可见；改为文本块轴对齐 `baseline−descent`），新增 caret 几何单测
 - [x] T3 回归：新增 `spacing_follows_eye_comfort_rules` 编译期守卫；测试用 `crate::PAD` 替代字面量 4；全量 `cargo test` 27 passed、clippy 无新增告警
+# Todo: prompt-input-gap
+
+- [x] T1 render.rs：`PROMPT_GAP` 常量 + draw() 内 prompt 后补间隙
+- [x] T2 caret 差值断言测试；全量 `cargo test`（55 passed）+ clippy 新增告警数为零
+# Todo: prompt-badge
+
+- [x] T1 render.rs：`PILL_*` 常量 + `right_cap_inset`；draw() 条带 → 胶囊
+- [x] T2 改写两条既有测试（胶囊形状/栏身统一 + 间距差值基数）
+- [x] T3 回归：全量 `cargo test`（55 passed）+ clippy 逐 lint diff 无新增
+# Todo: prompt-badge-r2
+
+- [x] 颜色 → 0x2e4a5c；胶囊两侧圆角；左缘收口断言；全量测试 55 passed + clippy 一致

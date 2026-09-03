@@ -12,15 +12,24 @@ pub const fn bgra(r: u8, g: u8, b: u8, a: u8) -> Bgra {
 /// Spotlight panel corner radius (logical px), clamped to half the panel size.
 pub const CORNER_RADIUS: u32 = 10;
 
+/// Fixed gap between the prompt label and the typed input (8px grid).
+const PROMPT_GAP: f32 = 8.0;
+/// Prompt pill: label badge hugging the text, rounded right cap.
+/// Vertical padding around the text block inside the pill.
+const PILL_VPAD: u32 = 2;
+/// Horizontal padding on each side of the label text inside the pill.
+const PILL_HPAD: f32 = 8.0;
+
 pub const BG_NORMAL: Bgra = bgra(0x22, 0x22, 0x22, 0xff);
 pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
 /// Input bar: a subtly lighter tone than the list, so bar and list read as
 /// separate pieces of one panel.
 pub const BG_PROMPT: Bgra = bgra(0x2e, 0x2e, 0x2e, 0xff);
 pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
-/// Prompt label strip: sits only behind the prompt text (e.g. "address"), so
-/// the label reads apart from the input content area (which stays `bg_prompt`).
-pub const BG_LABEL: Bgra = bgra(0x00, 0x45, 0x60, 0xff);
+/// Prompt label pill: compact capsule behind the prompt text (e.g. "address"),
+/// rounded on both sides, so the label reads apart from the input content area
+/// (the bar itself stays `bg_prompt`).
+pub const BG_LABEL: Bgra = bgra(0x2e, 0x4a, 0x5c, 0xff);
 pub const BG_SEL: Bgra = bgra(0x0f, 0x7c, 0xa6, 0xff);
 pub const FG_SEL: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 
@@ -33,7 +42,7 @@ pub struct Colors {
     pub fg_normal: Bgra,
     /// Prompt/input row background (`-M`).
     pub bg_prompt: Bgra,
-    /// Prompt label strip background (input bar stays `bg_prompt`).
+    /// Prompt label pill background (input bar stays `bg_prompt`).
     pub bg_label: Bgra,
     /// Prompt/input row foreground (`-m`).
     pub fg_prompt: Bgra,
@@ -94,6 +103,27 @@ pub fn rounded_span(w: u32, h: u32, r: u32, y: u32) -> (u32, u32) {
     (inset.min(w), w.saturating_sub(inset))
 }
 
+/// Horizontal inset of a pill cap at local row `y` (0-based within the pill):
+/// rows near the top/bottom caps pull the edge inward, the middle rows stay
+/// flush. The pill is a capsule, so both edges share the same inset. Radius is
+/// clamped to half the pill height — the cap is a semicircle. Same pixel math
+/// (py + 0.5) as `rounded_span`.
+fn cap_inset(h: u32, r: u32, y: u32) -> u32 {
+    let r = r.min(h / 2);
+    if r == 0 {
+        return 0;
+    }
+    let rr = (r * r) as f64;
+    let py = y as f64 + 0.5;
+    let top = r as f64;
+    let bottom = h as f64 - r as f64;
+    if py >= top && py <= bottom {
+        return 0;
+    }
+    let dy = if py < top { top - py } else { py - bottom };
+    (r as f64 - (rr - dy * dy).max(0.0).sqrt()).ceil() as u32
+}
+
 fn set_span(buf: &mut [u8], w: u32, y: u32, x0: u32, x1: u32, color: Bgra) {
     let row = &mut buf[(y * w + x0) as usize * 4..(y * w + x1) as usize * 4];
     for px in row.chunks_exact_mut(4) {
@@ -133,16 +163,27 @@ pub fn draw(
 
     // Prompt / input row text.
     let baseline = row_baseline(font, 0);
-    // The prompt label ("address") gets a distinct background strip, clipped to
-    // the rounded outline like the selection band below.
+    // The prompt label ("address") sits on a compact capsule, rounded on both
+    // sides, so the bar background stays uniformly bg_prompt (identical to the
+    // normal, prompt-less input bar).
     let mut x = p as f32;
     if !prompt.is_empty() {
-        let label_end = (p + measure(font, prompt, (w - 2 * p) as f32) as u32).min(w);
-        for yy in 0..row_h.min(h) {
-            let (x0, x1) = rounded_span(w, h, r, yy);
-            set_span(buf, w, yy, x0, x1.min(label_end), colors.bg_label);
+        let pill_h = font.line_h.ceil() as u32 + 2 * PILL_VPAD;
+        let pill_y = (font.row_h - pill_h) / 2;
+        let pill_x1 = (p as f32 + measure(font, prompt, (w - 2 * p) as f32) + 2.0 * PILL_HPAD)
+            .min(w as f32 - p as f32) as u32;
+        let cap = pill_h / 2;
+        for yy in 0..pill_h {
+            let inset = cap_inset(pill_h, cap, yy);
+            let x0 = (p + inset).min(w);
+            let x1 = pill_x1.saturating_sub(inset).max(x0);
+            set_span(buf, w, pill_y + yy, x0, x1.min(w), colors.bg_label);
         }
-        x = draw_text(buf, w, h, font, p as f32, baseline, prompt, colors.fg_prompt, (w - 2 * p) as f32);
+        draw_text(buf, w, h, font, p as f32 + PILL_HPAD, baseline, prompt, colors.fg_prompt, (w - 2 * p) as f32);
+        // Eye-comfort: fixed on-grid gap between the pill's right cap and the
+        // first typed character — missing inter-element spacing increases
+        // regressive fixations (Rayner et al.).
+        x = pill_x1 as f32 + PROMPT_GAP;
     }
     if !query.is_empty() {
         x = draw_text(buf, w, h, font, x, baseline, &query, colors.fg_prompt, w as f32 - x - p as f32);
@@ -414,23 +455,36 @@ mod tests {
     }
 
     #[test]
-    fn prompt_label_has_distinct_background_from_input_area() {
+    fn prompt_label_is_a_rounded_pill_over_an_uniform_bar() {
         let def = Colors::default();
-        assert_ne!(def.bg_label, def.bg_prompt, "label strip must differ from input area");
+        assert_ne!(def.bg_label, def.bg_prompt, "label pill must differ from the bar");
 
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         draw(&mut buf, w, h, &font, "address", "", false, &[], crate::PAD, &def);
-        let mid = font.row_h / 2;
-        let px = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
-        // Behind the prompt text: label strip; right of it: input bar color.
-        assert_eq!(px(crate::PAD), &def.bg_label);
-        let label_end = crate::PAD + measure(&font, "address", (w - 2 * crate::PAD) as f32) as u32;
-        // +8 clears any antialiased bleed past the last glyph's advance.
-        assert_eq!(px(label_end + 8), &def.bg_prompt);
+        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
 
-        // Empty prompt → no strip; the whole bar stays bg_prompt.
+        let pill_h = font.line_h.ceil() as u32 + 2 * PILL_VPAD;
+        let pill_y = (font.row_h - pill_h) / 2;
+        let pill_x1 = (crate::PAD as f32
+            + measure(&font, "address", (w - 2 * crate::PAD) as f32)
+            + 2.0 * PILL_HPAD) as u32;
+        let mid = font.row_h / 2;
+
+        // Inside the pill (mid-height): label color; right of it and on the far
+        // right of the bar: uniform bg_prompt — the bar reads exactly like the
+        // normal, prompt-less input bar.
+        assert_eq!(px(crate::PAD + 1, mid), &def.bg_label);
+        assert_eq!(px(pill_x1 + 4, mid), &def.bg_prompt);
+        assert_eq!(px(w - 10, mid), &def.bg_prompt);
+        // Caps on both sides: the top pill row is pulled in on the left and the
+        // right (rounded); the middle row stays flush (span end is exclusive).
+        assert_eq!(px(crate::PAD, pill_y), &def.bg_prompt, "left cap must be rounded in");
+        assert_eq!(px(pill_x1 - 1, pill_y), &def.bg_prompt, "right cap must be rounded in");
+        assert_eq!(px(pill_x1 - 2, pill_y + pill_h / 2), &def.bg_label, "right mid must stay flush");
+
+        // Empty prompt → no pill; the whole bar stays bg_prompt.
         let mut buf2 = vec![0u8; (w * h * 4) as usize];
         draw(&mut buf2, w, h, &font, "", "x", false, &[], crate::PAD, &def);
         assert_eq!(&buf2[((mid * w + crate::PAD) * 4) as usize..][..4], &def.bg_prompt);
@@ -523,6 +577,41 @@ mod caret_tests {
         }
         assert_eq!(top, Some(top_expected), "caret must start at the text block top");
         assert_eq!(bottom, Some(top_expected + line_h - 1), "caret must span the full text block");
+    }
+
+    #[test]
+    fn prompt_gap_separates_pill_from_input() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (300u32, font.row_h);
+        let colors = Colors::default();
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        // Locate the solid 2px caret (same detector as the test above) for a
+        // given prompt; the query "fir" and caret stay identical in both frames.
+        let mut caret_x = |prompt: &str| -> u32 {
+            buf.fill(0);
+            draw(&mut buf, w, h, &font, prompt, "fir", false, &[], crate::PAD, &colors);
+            let mid = font.row_h / 2;
+            let at = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
+            for x in 1..w - 3 {
+                if at(x) == &colors.fg_prompt && at(x + 1) == &colors.fg_prompt
+                    && at(x - 1) != &colors.fg_prompt && at(x + 2) != &colors.fg_prompt
+                {
+                    return x;
+                }
+            }
+            panic!("caret not found for prompt {prompt:?}");
+        };
+        // With a prompt, the caret shifts right by the prompt's advance plus
+        // the pill's two horizontal paddings and the inter-element gap; without
+        // one it starts straight at the padding. f32 sums can round the
+        // measured delta up by one pixel.
+        let advance = measure(&font, "run:", (w - 2 * crate::PAD) as f32) as u32;
+        let separators = (2.0 * PILL_HPAD + PROMPT_GAP) as u32;
+        let delta = caret_x("run:") - caret_x("") - advance;
+        assert!(
+            (separators..=separators + 1).contains(&delta),
+            "pill and input must be separated by ~{separators}px, got {delta}"
+        );
     }
 }
 
