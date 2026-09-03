@@ -10,7 +10,11 @@ mod render;
 
 use std::io::{self, BufRead};
 use std::process::exit;
-use std::time::Duration;
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::reexports::calloop::EventLoop;
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
@@ -42,12 +46,46 @@ use wayland_client::{
 
 const DEFAULT_WIDTH: u32 = 640;
 const FONT_SIZE: f32 = 16.0;
-/// Panel content inset: must be >= corner radius so text never grazes the curve.
+/// Text antialiasing: LCD subpixel (`Rgb`) is noticeably sharper on 1× displays.
+/// Switch to `Bgr` for BGR-stripe panels (text would fringe on the wrong side)
+/// or `Gray` for neutral rendering without colour fringing.
+const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;/// Panel content inset: must be >= corner radius so text never grazes the curve.
 const PAD: u32 = 12;
 /// Away-from-edge float for the upper-center panel (bottom mode keeps 8px).
 const TOP_MARGIN: i32 = 32;
 /// ponytail: stdin can be huge; cap drawn rows and scroll instead of mapping a giant buffer.
 const MAX_VISIBLE: usize = 64;
+/// Rows of context kept above/below the selection while the list scrolls.
+const SCROLLOFF: usize = 1;
+/// Sanity bounds for `-W`/`-l`: zero or absurd values would size a degenerate
+/// or huge shm buffer.
+const MAX_WIDTH: u32 = 16384;
+const MAX_LINES: usize = 1000;
+/// Caret blink half-period; typing resets it to visible.
+const BLINK_PERIOD: Duration = Duration::from_millis(500);
+/// Height transition length for expand/collapse (Spotlight-style).
+const ANIM: Duration = Duration::from_millis(120);
+
+/// Height transition: ease-out cubic from `from` to `to`, in buffer pixels.
+/// Frame cost is ~2 ms even at 64 rows, so animating is affordable.
+struct Anim {
+    from: u32,
+    to: u32,
+    start: Instant,
+}
+
+impl Anim {
+    /// Current height plus whether the transition is still running.
+    fn height(&self, now: Instant) -> (u32, bool) {
+        let t = now.saturating_duration_since(self.start).as_secs_f32() / ANIM.as_secs_f32();
+        if t >= 1.0 {
+            return (self.to, false);
+        }
+        let e = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
+        let h = self.from as f32 + (self.to as f32 - self.from as f32) * e;
+        (h.round().max(0.0) as u32, true)
+    }
+}
 
 struct Opts {
     prompt: String,
@@ -55,6 +93,8 @@ struct Opts {
     lines: usize,
     ci: bool,
     font: Option<String>,
+    /// `-o NAME`: show the panel on that output (wmenu `-o`).
+    output: Option<String>,
     run: bool,
     bottom: bool,
     password: bool,
@@ -63,13 +103,13 @@ struct Opts {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: rmenu [-biPv] [-f font.ttf|FAMILY [style] [pt|Npx]] [-l lines] [-W width] [-p prompt] [--run]\n\
+        "usage: rmenu [-biPv] [-f font.ttf|FAMILY [style] [pt|Npx]] [-l lines] [-W width] [-p prompt] [-o output] [--run]\n\
                [-N color] [-n color] [-M color] [-m color] [-S color] [-s color]\n\
          \n\
          Reads lines from stdin and prints the selected line to stdout.\n\
          `--run` ignores stdin, lists .desktop applications, and launches the selection.\n\
          `-b` shows the menu at the bottom of the screen; `-P` masks typed input as asterisks;\n\
-         `-i` matches case-insensitively.\n\
+         `-i` matches case-insensitively; `-o` shows the menu on the named output.\n\
          Colors are wmenu-style `RRGGBB[AA]`: `-N`/`-n` normal bg/fg, `-M`/`-m` prompt bg/fg,\n\
          `-S`/`-s` selection bg/fg."
     );
@@ -83,6 +123,7 @@ fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
         lines: 0,
         ci: false,
         font: None,
+        output: None,
         run: false,
         bottom: false,
         password: false,
@@ -96,9 +137,22 @@ fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
             "-b" => o.bottom = true,
             "-P" => o.password = true,
             "-p" => o.prompt = args.next().unwrap_or_else(|| usage()),
-            "-l" => o.lines = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage()),
-            "-W" => o.width = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage()),
+            "-l" => {
+                let n: usize = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage());
+                if !valid_lines(n) {
+                    usage();
+                }
+                o.lines = n;
+            }
+            "-W" => {
+                let n: u32 = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage());
+                if !valid_width(n) {
+                    usage();
+                }
+                o.width = n;
+            }
             "-f" => o.font = Some(args.next().unwrap_or_else(|| usage())),
+            "-o" => o.output = Some(args.next().unwrap_or_else(|| usage())),
             "-N" => o.colors.bg_normal = color(args.next().unwrap_or_else(|| usage())),
             "-n" => o.colors.fg_normal = color(args.next().unwrap_or_else(|| usage())),
             "-M" => o.colors.bg_prompt = color(args.next().unwrap_or_else(|| usage())),
@@ -128,16 +182,19 @@ fn parse_opts() -> Opts {
 fn main() {
     let opts = parse_opts();
 
-    let items: Vec<items::Item> = if opts.run {
-        desktop::merged(desktop::load_apps(), desktop::path_commands())
+    // `--run` data is local and cheap, so it loads synchronously. Stdin may
+    // come from a slow producer (`find / | rmenu`), so it streams in a thread
+    // while the menu is already on screen.
+    let (items, feed): (Vec<items::Item>, Option<Arc<ItemFeed>>) = if opts.run {
+        let merged = desktop::merged(desktop::load_apps(), desktop::path_commands());
+        if merged.is_empty() {
+            eprintln!("rmenu: no items");
+            exit(1);
+        }
+        (merged, None)
     } else {
-        let stdin = io::stdin();
-        stdin.lock().lines().filter_map(|l| l.ok()).map(|l| items::parse(&l)).collect()
+        (Vec::new(), Some(ItemFeed::spawn()))
     };
-    if items.is_empty() {
-        eprintln!("rmenu: no items");
-        exit(1);
-    }
 
     let font = font::MenuFont::load(opts.font.as_deref(), FONT_SIZE)
         .unwrap_or_else(|e| { eprintln!("rmenu: {e}"); exit(1) });
@@ -166,9 +223,32 @@ fn main() {
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
 
-    let (_visible, height) = visible_rows(&items, opts.lines, &font);
+    // `-o NAME` binds the panel to that output; the compositor picks otherwise.
+    // A roundtrip is needed first so the compositor has sent output names.
+    let output_state = OutputState::new(&globals, &qh);
+    let target = match opts.output.as_deref() {
+        Some(name) => {
+            conn.roundtrip().unwrap_or_else(|e| {
+                eprintln!("rmenu: {e}");
+                exit(1);
+            });
+            let found = output_state
+                .outputs()
+                .find(|o| output_state.info(o).and_then(|i| i.name).as_deref() == Some(name));
+            match found {
+                Some(o) => Some(o),
+                None => {
+                    eprintln!("rmenu: no output named {name}");
+                    exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+    let height = font.row_h * (row_capacity(opts.lines) as u32 + 1);
     let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("rmenu"), None);
+    let layer =
+        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("rmenu"), target.as_ref());
     layer.set_anchor(if opts.bottom { Anchor::BOTTOM } else { Anchor::TOP });
     layer.set_margin(if opts.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
@@ -181,10 +261,11 @@ fn main() {
         .expect("failed to allocate shm pool");
 
     let item_count = items.len();
+    let bar_h = font.row_h;
     let mut app = App {
         registry_state: RegistryState::new(&globals),
         seat_state: SeatState::new(&globals, &qh),
-        output_state: OutputState::new(&globals, &qh),
+        output_state,
         shm,
         compositor,
         layer_shell,
@@ -193,11 +274,14 @@ fn main() {
         qh: qh.clone(),
         keyboard: None,
         items,
+        feed,
         menu: MenuState::new(item_count),
         top: 0,
         font,
+        font_spec: opts.font.clone(),
         prompt: opts.prompt.clone(),
         width: opts.width,
+        scale: 1,
         lines: opts.lines,
         ci: opts.ci,
         colors: opts.colors,
@@ -206,8 +290,14 @@ fn main() {
         output_w: None,
         dirty: false,
         frame_pending: false,
+        blink: true,
+        next_blink: Instant::now() + BLINK_PERIOD,
+        anim: None,
+        target_h: None,
+        shown_h: bar_h,
         first_configure: true,
         run: opts.run,
+        no_items: false,
         mods: Modifiers::default(),
         loop_handle,
     };
@@ -216,6 +306,8 @@ fn main() {
         if event_loop.dispatch(Duration::from_millis(16), &mut app).is_err() {
             break;
         }
+        app.sync_items();
+        app.tick();
         if app.menu.done.is_some() {
             break;
         }
@@ -223,10 +315,27 @@ fn main() {
     app.finish();
 }
 
-/// Number of item rows to draw and the resulting surface height (incl. prompt row).
-fn visible_rows(items: &[items::Item], lines: usize, font: &font::MenuFont) -> (usize, u32) {
-    let visible = if lines > 0 { lines.min(items.len()) } else { items.len().min(MAX_VISIBLE) };
-    (visible, font.row_h * (visible as u32 + 1))
+/// `-W` must be a usable panel width (0 would create a zero-width buffer).
+fn valid_width(w: u32) -> bool {
+    (1..=MAX_WIDTH).contains(&w)
+}
+
+/// `-l 0` means "auto" (see `row_capacity`); the cap keeps the pool hint sane.
+fn valid_lines(n: usize) -> bool {
+    n <= MAX_LINES
+}
+
+/// Subpixel AA pays off on 1× outputs; on HiDPI the pixel grid is already dense,
+/// so it only adds colour fringing and ~55% more paint time there.
+fn text_aa(scale: u32) -> render::Subpixel {
+    if scale > 1 { render::Subpixel::Gray } else { TEXT_AA }
+}
+
+/// Row capacity for the shm pool: stdin streams in, so size for the cap up
+/// front instead of whatever happened to arrive by startup. (The pool grows on
+/// demand anyway; this is the initial hint.)
+fn row_capacity(lines: usize) -> usize {
+    if lines > 0 { lines } else { MAX_VISIBLE }
 }
 
 /// Menu outcome: `None` while running, `Some` once the user (or an error) closed it.
@@ -400,6 +509,65 @@ impl MenuState {
     }
 }
 
+/// Stdin lines arriving from a reader thread. The event loop already polls
+/// every 16ms, so the queue only needs a mutex — no extra wakeup source.
+struct ItemFeed {
+    queue: Mutex<Vec<items::Item>>,
+    done: AtomicBool,
+}
+
+impl ItemFeed {
+    fn new() -> Arc<Self> {
+        Arc::new(Self { queue: Mutex::new(Vec::new()), done: AtomicBool::new(false) })
+    }
+
+    fn push(&self, batch: Vec<items::Item>) {
+        self.queue.lock().unwrap().extend(batch);
+    }
+
+    fn drain(&self) -> Vec<items::Item> {
+        std::mem::take(&mut *self.queue.lock().unwrap())
+    }
+
+    fn mark_done(&self) {
+        self.done.store(true, Ordering::Release);
+    }
+
+    fn done(&self) -> bool {
+        self.done.load(Ordering::Acquire)
+    }
+
+    /// Read stdin to EOF in a background thread, handing lines over in batches
+    /// so a slow producer never delays the menu appearing.
+    fn spawn() -> Arc<Self> {
+        let feed = Self::new();
+        let reader = Arc::clone(&feed);
+        std::thread::spawn(move || {
+            reader.read_into(io::stdin().lock());
+            reader.mark_done();
+        });
+        feed
+    }
+
+    /// Drain a reader into batches. A line that is not valid UTF-8 is skipped,
+    /// never a reason to stop: truncating the menu at the first bad filename
+    /// would silently hide everything after it.
+    fn read_into(&self, reader: impl BufRead) {
+        const BATCH: usize = 256;
+        let mut batch = Vec::with_capacity(BATCH);
+        for line in reader.lines() {
+            let Ok(line) = line else { continue };
+            batch.push(items::parse(&line));
+            if batch.len() >= BATCH {
+                self.push(std::mem::take(&mut batch));
+            }
+        }
+        if !batch.is_empty() {
+            self.push(batch);
+        }
+    }
+}
+
 #[allow(dead_code)] // state objects kept alive for their proxy bindings
 struct App {
     registry_state: RegistryState,
@@ -416,11 +584,17 @@ struct App {
     /// `update_modifiers` is the only place they arrive.
     mods: Modifiers,
     items: Vec<items::Item>,
+    /// Stdin lines still streaming in (`None` in `--run` mode).
+    feed: Option<Arc<ItemFeed>>,
     menu: MenuState,
     top: usize,
     font: font::MenuFont,
+    /// The `-f` spec, kept so the font can be re-derived at a new scale.
+    font_spec: Option<String>,
     prompt: String,
     width: u32,
+    /// Output scale (HiDPI density); 1 until `surface_enter` reports it.
+    scale: u32,
     lines: usize,
     ci: bool,
     colors: render::Colors,
@@ -431,8 +605,19 @@ struct App {
     output_w: Option<u32>,
     dirty: bool,
     frame_pending: bool,
+    /// Caret blink state and when to toggle it next (typing keeps it solid).
+    blink: bool,
+    next_blink: Instant,
+    /// Height transition in flight, the height it is heading for, and the height
+    /// last rendered (the animation's starting point).
+    anim: Option<Anim>,
+    target_h: Option<u32>,
+    shown_h: u32,
     first_configure: bool,
     run: bool,
+    /// Stdin closed without producing a single line (keeps the old
+    /// `rmenu: no items` + exit 1 contract).
+    no_items: bool,
     loop_handle: smithay_client_toolkit::reexports::calloop::LoopHandle<'static, App>,
 }
 
@@ -445,7 +630,66 @@ impl App {
         }
     }
 
+    /// Pull streamed stdin lines into the menu. Called every loop tick and
+    /// before a key is handled, so typing always filters the freshest list.
+    fn sync_items(&mut self) {
+        let Some(feed) = self.feed.clone() else { return };
+        let fresh = feed.drain();
+        if !fresh.is_empty() {
+            let sel = self.menu.sel;
+            self.items.extend(fresh);
+            self.menu.refilter(&self.items, self.ci);
+            // Keep the highlighted row steady while more data streams in.
+            self.menu.sel = sel.min(self.menu.matches.len().saturating_sub(1));
+            self.request_draw();
+        }
+        if feed.done() && self.items.is_empty() && !self.no_items {
+            self.no_items = true;
+            self.menu.done = Some(Done::Cancel);
+        }
+    }
+
+    /// Adopt the output's HiDPI density: re-derive the font at `scale`× the
+    /// logical size, so the buffer is rendered at native density (crisp text)
+    /// instead of being upscaled by the compositor.
+    fn apply_scale(&mut self, scale: i32) {
+        let scale = scale.max(1) as u32;
+        if scale == self.scale {
+            return;
+        }
+        self.scale = scale;
+        if let Ok(font) = font::MenuFont::load(self.font_spec.as_deref(), FONT_SIZE * scale as f32) {
+            self.font = font;
+        }
+        self.request_draw();
+    }
+
+    /// Caret blink: toggle every `BLINK_PERIOD` while idle. Typing calls
+    /// `wake_caret` so the caret stays solid while the user is working.
+    fn tick(&mut self) {
+        // Keep a height transition moving; the loop's 16 ms timeout is our
+        // frame clock (the Wayland frame callback only paces real frames).
+        if let Some(a) = &self.anim
+            && a.height(Instant::now()).1
+        {
+            self.request_draw();
+        }
+        if Instant::now() < self.next_blink {
+            return;
+        }
+        self.blink = !self.blink;
+        self.next_blink = Instant::now() + BLINK_PERIOD;
+        self.request_draw();
+    }
+
+    fn wake_caret(&mut self) {
+        self.blink = true;
+        self.next_blink = Instant::now() + BLINK_PERIOD;
+    }
+
     fn on_key(&mut self, keysym: Keysym, utf8: Option<String>) {
+        self.sync_items();
+        self.wake_caret();
         let visible = self.visible();
         self.menu.on_key(keysym, utf8, self.mods, &self.items, self.ci, visible);
         // Ctrl-Return multi-select: emit each pick while the menu keeps running.
@@ -488,23 +732,42 @@ impl App {
         let visible = if self.menu.query.is_empty() { 0 } else { self.visible() };
         let total = self.menu.matches.len();
 
-        // Keep the selection in view (only meaningful while the list is shown).
+        // Keep the selection in view with one row of context on each side
+        // (scrolloff), so the band never sits flush against a panel edge while
+        // more rows exist beyond it.
         let mut rows: Vec<render::Row> = Vec::with_capacity(visible);
         if visible > 0 {
-            if self.menu.sel >= self.top + visible && visible > 0 {
-                self.top = self.menu.sel + 1 - visible;
-            } else if self.menu.sel < self.top {
-                self.top = self.menu.sel;
+            let max_top = total.saturating_sub(visible);
+            if total > visible && self.menu.sel + SCROLLOFF >= self.top + visible {
+                self.top = (self.menu.sel + SCROLLOFF + 1).saturating_sub(visible).min(max_top);
+            } else if self.menu.sel < self.top.saturating_add(SCROLLOFF) {
+                self.top = self.menu.sel.saturating_sub(SCROLLOFF).min(max_top);
             }
-            let top = self.top.min(total.saturating_sub(1));
+            let top = self.top;
             for (i, &mi) in self.menu.matches[top..(top + visible).min(total)].iter().enumerate() {
                 let it = &self.items[mi];
                 rows.push(render::Row { text: &it.text, selected: top + i == self.menu.sel });
             }
         }
 
+        let scale = self.scale;
         let w = self.width;
-        let h = self.font.row_h * (visible as u32 + 1);
+        // `font.row_h` already includes the density, so heights here are buffer
+        // pixels; the layer surface itself is sized in logical pixels.
+        let target = self.font.row_h * (visible as u32 + 1);
+        // Smooth every height change: the bar expanding into a list, the list
+        // growing/shrinking as the query narrows, and the collapse back to the
+        // bar. Each new target restarts the ease from what is on screen now.
+        let now = Instant::now();
+        if self.target_h != Some(target) {
+            self.anim = Some(Anim { from: self.shown_h, to: target, start: now });
+            self.target_h = Some(target);
+        }
+        let (h, running) = self.anim.as_ref().map_or((target, false), |a| a.height(now));
+        if !running {
+            self.anim = None;
+        }
+        self.shown_h = h;
         if self.bottom {
             layer.set_margin(8, 0, 0, 0);
         } else {
@@ -512,11 +775,13 @@ impl App {
             let left = self.output_w.map(|ow| ((ow as i64 - w as i64) / 2).max(0) as i32).unwrap_or(0);
             layer.set_margin(TOP_MARGIN, 0, 0, left);
         }
-        layer.set_size(w, h);
+        layer.set_size(w, h.div_ceil(scale));
+        let _ = layer.set_buffer_scale(scale);
 
+        let bw = w * scale;
         let (buffer, canvas) = match self
             .pool
-            .create_buffer(w as i32, h as i32, (w * 4) as i32, wl_shm::Format::Argb8888)
+            .create_buffer(bw as i32, h as i32, (bw * 4) as i32, wl_shm::Format::Argb8888)
         {
             Ok(b) => b,
             Err(e) => {
@@ -525,9 +790,17 @@ impl App {
                 return;
             }
         };
-        render::draw(canvas, w, h, &self.font, &self.prompt, &self.menu.query, self.password, &rows, PAD, &self.colors);
+        render::draw(canvas, bw, h, &self.font, &self.prompt, &self.menu.query, self.password, &rows, PAD, &self.colors, scale, self.blink, text_aa(scale));
 
-        layer.wl_surface().damage_buffer(0, 0, w as i32, h as i32);
+        // Scroll position indicator: only while the list overflows the viewport.
+        if let Some((ty, th)) = render::scroll_thumb(self.font.row_h, h.saturating_sub(self.font.row_h), visible, total, self.top) {
+            let pad = PAD * scale;
+            let tw = 3 * scale;
+            let tx = bw - pad + pad.saturating_sub(tw) / 2;
+            render::rect(canvas, bw, h, tx, ty, tw, th, self.colors.label_accent);
+        }
+
+        layer.wl_surface().damage_buffer(0, 0, bw as i32, h as i32);
         let surface = layer.wl_surface().clone();
         surface.frame(&self.qh, FrameCallbackData(surface.clone()));
         if buffer.attach_to(layer.wl_surface()).is_err() {
@@ -540,6 +813,10 @@ impl App {
     }
 
     fn finish(&mut self) {
+        if self.no_items {
+            eprintln!("rmenu: no items");
+            exit(1);
+        }
         match self.menu.done.take() {
             Some(Done::Select(value)) => {
                 if self.run {
@@ -560,8 +837,9 @@ impl CompositorHandler for App {
         _: &Connection,
         _: &QueueHandle<Self>,
         _: &wl_surface::WlSurface,
-        _: i32,
+        scale: i32,
     ) {
+        self.apply_scale(scale);
     }
     fn transform_changed(
         &mut self,
@@ -590,17 +868,15 @@ impl CompositorHandler for App {
         _: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        if let Some(w) = self
-            .output_state
-            .info(output)
-            .and_then(|i| i.logical_size)
-            .map(|(w, _)| w.max(0) as u32)
+        let Some(info) = self.output_state.info(output) else { return };
+        if let Some((w, _)) = info.logical_size
+            && self.output_w != Some(w.max(0) as u32)
         {
-            if self.output_w != Some(w) {
-                self.output_w = Some(w); // center the panel on this output
-                self.request_draw();
-            }
+            let w = w.max(0) as u32;
+            self.output_w = Some(w); // center the panel on this output
+            self.request_draw();
         }
+        self.apply_scale(info.scale_factor);
     }
     fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
 }
@@ -661,10 +937,10 @@ impl SeatHandler for App {
         _: wl_seat::WlSeat,
         capability: Capability,
     ) {
-        if capability == Capability::Keyboard {
-            if let Some(kb) = self.keyboard.take() {
-                kb.release();
-            }
+        if capability == Capability::Keyboard
+            && let Some(kb) = self.keyboard.take()
+        {
+            kb.release();
         }
     }
     fn remove_seat(&mut self, _: &Connection, _: &QueueHandle<Self>, _: wl_seat::WlSeat) {}
@@ -764,10 +1040,78 @@ smithay_client_toolkit::delegate_dispatch2!(App);
 mod tests {
     use super::*;
 
+    #[test]
+    fn item_feed_drains_batches_in_order_and_signals_eof() {
+        let feed = ItemFeed::new();
+        feed.push(vec![items::parse("a")]);
+        feed.push(vec![items::parse("b"), items::parse("c")]);
+        let got: Vec<String> = feed.drain().into_iter().map(|i| i.text).collect();
+        assert_eq!(got, vec!["a", "b", "c"]);
+        assert!(feed.drain().is_empty(), "drain empties the queue");
+        assert!(!feed.done());
+        feed.mark_done();
+        assert!(feed.done());
+    }
+
+    #[test]
+    fn output_flag_is_parsed() {
+        assert_eq!(opts(&["-o", "HDMI-A-1"]).output.as_deref(), Some("HDMI-A-1"));
+        assert_eq!(opts(&[]).output, None);
+    }
+
+    #[test]
+    fn item_feed_skips_invalid_utf8_without_truncating() {
+        let feed = ItemFeed::new();
+        feed.read_into(&b"good\n\xff not utf8\nlast\n"[..]);
+        let got: Vec<String> = feed.drain().into_iter().map(|i| i.text).collect();
+        assert_eq!(got, vec!["good", "last"], "a bad line must not end the stream");
+    }
+
+    #[test]
+    fn subpixel_aa_is_only_used_at_scale_one() {
+        assert_eq!(text_aa(1), render::Subpixel::Rgb, "1× displays get the sharper mode");
+        assert_eq!(text_aa(2), render::Subpixel::Gray, "HiDPI does not need it (and pays for it)");
+    }
+
+    #[test]
+    fn width_and_lines_bounds_are_validated() {
+        assert!(valid_width(640) && valid_width(1) && valid_width(MAX_WIDTH));
+        assert!(!valid_width(0), "zero width would make a degenerate buffer");
+        assert!(!valid_width(MAX_WIDTH + 1));
+        assert!(valid_lines(0) && valid_lines(MAX_LINES), "0 means auto");
+        assert!(!valid_lines(MAX_LINES + 1));
+    }
+
+    #[test]
+    fn animation_eases_to_the_target_and_stops() {
+        let start = Instant::now();
+        let grow = Anim { from: 24, to: 1560, start };
+        assert_eq!(grow.height(start), (24, true), "starts at the from height");
+        let (mid, running) = grow.height(start + ANIM / 2);
+        assert!(running && mid > 24 && mid < 1560, "mid-flight is between the ends: {mid}");
+        assert_eq!(grow.height(start + ANIM), (1560, false), "ends exactly at the target");
+        assert_eq!(grow.height(start + ANIM + Duration::from_millis(50)).0, 1560);
+
+        // Collapsing runs the same way, monotonically (no bounce).
+        let shrink = Anim { from: 1560, to: 24, start };
+        let mut prev = 1560;
+        for ms in 0..=ANIM.as_millis() as u64 {
+            let (h, _) = shrink.height(start + Duration::from_millis(ms));
+            assert!(h <= prev, "collapse must not bounce: {h} > {prev}");
+            prev = h;
+        }
+        assert_eq!(prev, 24, "collapse reaches the bar height");
+    }
+
     fn sample_items() -> Vec<items::Item> {
         ["firefox", "alacritty", "libreoffice"]
             .iter()
-            .map(|s| items::Item { lc: s.to_lowercase(), text: s.to_string(), value: s.to_string() })
+            .map(|s| items::Item {
+                lc: s.to_lowercase(),
+                text: s.to_string(),
+                value: s.to_string(),
+                extra: String::new(),
+            })
             .collect()
     }
 

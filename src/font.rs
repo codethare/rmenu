@@ -2,9 +2,35 @@
 //! (CJK-capable preferred so Chinese labels render).
 
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 #[cfg(test)]
 use ab_glyph::GlyphId;
+
+/// One coverage plane of a rasterized glyph: 8-bit coverage plus where it sits
+/// relative to the canonical pen position (the pen with only its subpixel part
+/// kept).
+#[derive(Default, Clone)]
+pub struct GlyphPlane {
+    pub min_x: i32,
+    pub min_y: i32,
+    pub w: u32,
+    pub h: u32,
+    pub coverage: Vec<u8>,
+}
+
+/// One rasterized glyph: the advance to move the pen by, and its coverage
+/// planes — one for grayscale antialiasing, three (left/middle/right subpixel
+/// sample) for LCD subpixel antialiasing.
+pub struct GlyphBitmap {
+    pub advance: f32,
+    pub planes: Vec<GlyphPlane>,
+}
+
+/// Glyph cache key: (face index, glyph id, subpixel x bucket, subpixel y bucket,
+/// antialiasing mode).
+pub type GlyphKey = (u8, u16, u8, u8, u8);
 
 pub struct MenuFont {
     pub font: FontVec,
@@ -17,6 +43,11 @@ pub struct MenuFont {
     pub line_h: f32,
     /// Row height incl. padding.
     pub row_h: u32,
+    /// Rasterized glyphs reused across frames: without this every frame
+    /// re-rasterizes every glyph, which dominates a full (64-row) frame
+    /// (~8.4 ms measured). Discarded wholesale when the font is re-derived
+    /// for a new scale, so a scale change cannot serve stale bitmaps.
+    pub glyphs: RefCell<HashMap<GlyphKey, GlyphBitmap>>,
 }
 
 impl MenuFont {
@@ -25,11 +56,11 @@ impl MenuFont {
         // `-f /path/to/font.ttf`: use exactly that face — no system font scan,
         // no fallback chain (wmenu -f semantics). This is the fast-startup
         // path: building the system chain scans every installed font (~100ms).
-        if let Some(s) = spec {
-            if let Ok(bytes) = std::fs::read(s) {
-                let font = FontVec::try_from_vec(bytes).map_err(|e| format!("invalid font: {e}"))?;
-                return Ok(Self::build(font, Vec::new(), size));
-            }
+        if let Some(s) = spec
+            && let Ok(bytes) = std::fs::read(s)
+        {
+            let font = FontVec::try_from_vec(bytes).map_err(|e| format!("invalid font: {e}"))?;
+            return Ok(Self::build(font, Vec::new(), size));
         }
 
         let chain = cached_system_chain();
@@ -63,11 +94,21 @@ impl MenuFont {
         let ascent_px = scaled.ascent();
         let descent_px = scaled.descent();
         let line_h = scaled.height(); // == size by definition of PxScale
-        // Comfortable row height ≈1.5× font size: glyphs breathe top/bottom,
-        // and the tall selection band is an easier target to hit (Fitts).
-        const ROW_VPAD: u32 = 4;
-        let row_h = line_h.ceil() as u32 + 2 * ROW_VPAD;
-        MenuFont { font, fallbacks, size, ascent_px, descent_px, line_h, row_h }
+        // Comfortable row height ≈1.5× font size: glyphs breathe top/bottom
+        // (the vertical pad is a quarter of the em on each side), and the tall
+        // selection band is an easier target to hit (Fitts). Derived from the
+        // size so the ratio survives HiDPI scales.
+        let row_h = line_h.ceil() as u32 + 2 * (size * 0.25).round() as u32;
+        MenuFont {
+            font,
+            fallbacks,
+            size,
+            ascent_px,
+            descent_px,
+            line_h,
+            row_h,
+            glyphs: RefCell::new(HashMap::new()),
+        }
     }
 
     /// True if any face in the chain (primary first) has a glyph for `ch`.
@@ -97,11 +138,11 @@ fn parse_spec(spec: &str) -> (String, fontdb::Weight, Option<f32>) {
     let mut weight = fontdb::Weight::NORMAL;
     let mut size = None;
     for tok in spec.split_whitespace() {
-        if size.is_none() {
-            if let Some(s) = size_in_px(tok) {
-                size = Some(s);
-                continue;
-            }
+        if size.is_none()
+            && let Some(s) = size_in_px(tok)
+        {
+            size = Some(s);
+            continue;
         }
         if let Some(w) = weight_of(tok) {
             weight = w;

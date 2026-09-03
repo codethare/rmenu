@@ -9,10 +9,18 @@ pub struct Item {
     /// Lowercased copy of `text`, precomputed so `-i` filtering never
     /// lowercases per item per token on every keystroke.
     pub lc: String,
+    /// Extra lowercase haystack that matches but is never displayed
+    /// (`--run` pulls `.desktop` `Keywords=` in here).
+    pub extra: String,
 }
 
 pub fn parse(line: &str) -> Item {
-    Item { lc: line.to_lowercase(), text: line.to_string(), value: line.to_string() }
+    Item {
+        lc: line.to_lowercase(),
+        text: line.to_string(),
+        value: line.to_string(),
+        extra: String::new(),
+    }
 }
 
 fn contains(haystack: &str, needle: &str) -> bool {
@@ -34,12 +42,21 @@ pub fn filter(items: &[Item], query: &str, ci: bool) -> Vec<usize> {
     }
     let query = if ci { query.to_lowercase() } else { query.to_string() };
     let toks: Vec<&str> = query.split_whitespace().collect();
+    // Keywords are matched case-insensitively in both modes: they are never
+    // displayed, so the user cannot see which case they were written in.
+    let ktoks: Vec<String> =
+        if ci { Vec::new() } else { toks.iter().map(|t| t.to_lowercase()).collect() };
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
     let mut sub = Vec::new();
     for (i, it) in items.iter().enumerate() {
         let hay = if ci { &it.lc } else { &it.text };
-        if !toks.iter().all(|t| contains(hay, t)) {
+        let all = toks.iter().enumerate().all(|(n, t)| {
+            contains(hay, t)
+                || (!it.extra.is_empty()
+                    && contains(&it.extra, if ci { t } else { &ktoks[n] }))
+        });
+        if !all {
             continue;
         }
         let bucket = match toks.len() {
@@ -76,6 +93,19 @@ mod tests {
         // exact prefix first (in original order), then substring matches; "LIBREoffice"
         // is case-mismatched so it is not a substring match here.
         assert_eq!(got, vec!["libre/server", "libre", "libreoffice", "not-libre"]);
+    }
+
+    #[test]
+    fn keywords_match_without_affecting_rank() {
+        let mut it = items(&["Firefox", "LibreOffice"]);
+        it[0].extra = "browser web internet".to_string();
+        // A keyword-only hit still matches...
+        assert_eq!(filter(&it, "browser", false), vec![0]);
+        // ...case-insensitively, even without `-i`...
+        assert_eq!(filter(&it, "BROWSER", false), vec![0]);
+        // ...and does not disturb ranking: "fire" is still a text prefix hit.
+        assert_eq!(filter(&it, "fire web", true), vec![0]);
+        assert!(filter(&it, "browser", false).len() == 1);
     }
 
     #[test]

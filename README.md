@@ -12,6 +12,8 @@ the whole UI is drawn by `ab_glyph`.
 
 - wmenu/dmenu-style filtering: every space-separated query token must be a
   substring; ranking is exact > prefix > substring
+- lists stream in: the menu shows immediately and rows fill in as stdin
+  produces them, so slow producers (`find / | rmenu`) stay responsive
 - `Ctrl`-free text input, `Up`/`Down`/`Ctrl-n`/`Ctrl-p`/`PgUp`/`PgDn`/`Home`/`End` navigation, key
   repeat, long-list scrolling, case-insensitive matching (`-i`), `Tab` completes
   the highlighted entry into the input; `Ctrl-c`/`Ctrl-g` cancel, `Ctrl-h`
@@ -20,11 +22,16 @@ the whole UI is drawn by `ab_glyph`.
   `Ctrl-Return` multi-selects (prints each pick, keeps running)
 - Spotlight-style UI: rounded corners; launch shows only the input bar in the
   upper-center of the screen, results appear as you type, and the menu
-  collapses back to the bar when the query is cleared
+  collapses back to the bar when the query is cleared. Height changes ease over
+  120 ms instead of jumping
+- text is antialiased with LCD subpixel filtering on 1× outputs (sharper on a
+  normal-DPI screen) and neutral grayscale AA on HiDPI, where subpixel only
+  costs time and adds colour fringes
 - `--run` launcher mode: scans `.desktop` files and launches the selection
   via `sh -c` — and merges in everything on `$PATH`, deduped with the desktop
-  entries winning (like wmenu-run, files are listed by name — no per-entry
-  exec check, so non-executables may appear)
+  entries winning. Hidden entries, `Terminal=true` entries, entries for other
+  desktops (`OnlyShowIn`/`NotShowIn`), and non-executable PATH files are
+  skipped; a localized `Name[locale]` is preferred when it matches the locale.
 - CJK text renders (auto-picks a CJK-capable system font)
 
 ## Build / run
@@ -48,7 +55,7 @@ printf 'alacritty\nfirefox\n' | rmenu -i -p 'run: '
 
 Options (wmenu-compatible subset): `-b` (menu at screen bottom), `-P` (mask typed
 input as asterisks), `-i` (case-insensitive), `-l lines` (visible rows), `-W width`,
-`-p prompt`, `-f font.ttf|"FAMILY [style] [pt|Npx]"` (bare size is points, `Npx` is
+`-p prompt`, `-o output` (show on the named output), `-f font.ttf|"FAMILY [style] [pt|Npx]"` (bare size is points, `Npx` is
 pixels — wmenu/Pango convention), `-v` (print version), `--run`, `-h`.
 
 Colors are wmenu-style `RRGGBB[AA]`: `-N` normal bg, `-n` normal fg, `-M` prompt bg,
@@ -65,6 +72,12 @@ set $menu rmenu --run
 bindsym $mod+d exec $menu
 ```
 
+## Manual
+
+`docs/rmenu.1` is a roff manual page. View it with `man ./docs/rmenu.1`, or
+install it with
+`install -Dm644 docs/rmenu.1 /usr/share/man/man1/rmenu.1`.
+
 ## Known limits
 
 - No IME: typing CJK into the filter field needs a Wayland input-method
@@ -73,3 +86,8 @@ bindsym $mod+d exec $menu
   buffer bounded); pass `-l N` for a fixed height.
 - No xdg-activation token on launch (`--run`); windows may not grab focus on
   some compositors.
+- Fractional output scaling (1.25/1.5) renders at the output's integer scale;
+  HiDPI integer scales (2x) render natively crisp.
+- Subpixel antialiasing assumes an RGB-stripe panel. On a BGR panel (text
+  fringing on the wrong side) set `main::TEXT_AA` in `src/main.rs` to
+  `render::Subpixel::Bgr`, or to `Gray` to disable it everywhere.

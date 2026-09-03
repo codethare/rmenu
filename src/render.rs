@@ -12,15 +12,28 @@ pub const fn bgra(r: u8, g: u8, b: u8, a: u8) -> Bgra {
 /// Spotlight panel corner radius (logical px), clamped to half the panel size.
 pub const CORNER_RADIUS: u32 = 10;
 
+/// Fully transparent pixel: everything outside the rounded panel outline.
+const CLEAR: Bgra = [0, 0, 0, 0];
+
+/// Fixed gap between the prompt label and the typed input (8px grid).
+const PROMPT_GAP: f32 = 8.0;
+/// Prompt label rail: vertical accent strip on the bar's left edge.
+/// Vertical padding defines its height (text line + vpad both sides) —
+/// the same rhythm the capsule used.
+const PILL_VPAD: u32 = 2;
+/// Width of the label rail.
+const LABEL_RAIL_W: u32 = 4;
+
 pub const BG_NORMAL: Bgra = bgra(0x22, 0x22, 0x22, 0xff);
 pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
 /// Input bar: a subtly lighter tone than the list, so bar and list read as
 /// separate pieces of one panel.
 pub const BG_PROMPT: Bgra = bgra(0x2e, 0x2e, 0x2e, 0xff);
 pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
-/// Prompt label strip: sits only behind the prompt text (e.g. "address"), so
-/// the label reads apart from the input content area (which stays `bg_prompt`).
-pub const BG_LABEL: Bgra = bgra(0x00, 0x45, 0x60, 0xff);
+/// Prompt label accent: a 4px rail on the input bar's left edge (option F); a
+/// deep slate blue that carries the emphasis while staying harmonious with the
+/// gray bar and apart from the selection blue.
+pub const LABEL_ACCENT: Bgra = bgra(0x2e, 0x4a, 0x5c, 0xff);
 pub const BG_SEL: Bgra = bgra(0x0f, 0x7c, 0xa6, 0xff);
 pub const FG_SEL: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 
@@ -33,8 +46,8 @@ pub struct Colors {
     pub fg_normal: Bgra,
     /// Prompt/input row background (`-M`).
     pub bg_prompt: Bgra,
-    /// Prompt label strip background (input bar stays `bg_prompt`).
-    pub bg_label: Bgra,
+    /// Prompt label accent (left rail; input bar stays `bg_prompt`).
+    pub label_accent: Bgra,
     /// Prompt/input row foreground (`-m`).
     pub fg_prompt: Bgra,
     /// Selected row background (`-S`).
@@ -49,7 +62,7 @@ impl Default for Colors {
             bg_normal: BG_NORMAL,
             fg_normal: FG_NORMAL,
             bg_prompt: BG_PROMPT,
-            bg_label: BG_LABEL,
+            label_accent: LABEL_ACCENT,
             fg_prompt: FG_PROMPT,
             bg_sel: BG_SEL,
             fg_sel: FG_SEL,
@@ -94,6 +107,27 @@ pub fn rounded_span(w: u32, h: u32, r: u32, y: u32) -> (u32, u32) {
     (inset.min(w), w.saturating_sub(inset))
 }
 
+/// Scrollbar thumb `(y, h)` for a `visible`-row viewport over `total` items at
+/// scroll offset `top`, inside a track starting at `track_y` with height
+/// `track_h`. `None` when everything fits (or there is no track). Length tracks
+/// the visible/total ratio so the indicator reads as "list continues".
+pub fn scroll_thumb(
+    track_y: u32,
+    track_h: u32,
+    visible: usize,
+    total: usize,
+    top: usize,
+) -> Option<(u32, u32)> {
+    if visible == 0 || total <= visible || track_h == 0 {
+        return None;
+    }
+    let th = ((track_h as u64 * visible as u64) / total as u64).clamp(1, track_h as u64) as u32;
+    let max_top = (total - visible) as u64;
+    let span = track_h.saturating_sub(th) as u64;
+    let ty = track_y + ((span * top.min(max_top as usize) as u64) / max_top) as u32;
+    Some((ty, th))
+}
+
 fn set_span(buf: &mut [u8], w: u32, y: u32, x0: u32, x1: u32, color: Bgra) {
     let row = &mut buf[(y * w + x0) as usize * 4..(y * w + x1) as usize * 4];
     for px in row.chunks_exact_mut(4) {
@@ -103,6 +137,8 @@ fn set_span(buf: &mut [u8], w: u32, y: u32, x0: u32, x1: u32, color: Bgra) {
 
 /// Draws the full frame. `buf` is `w*h*4` bytes in BGRA order.
 /// The first row is the prompt/input row, the rest are `rows`.
+/// `scale` is the buffer-to-logical density (HiDPI): `padding` and this
+/// module's geometry constants are logical and are multiplied by it here.
 #[allow(clippy::too_many_arguments)]
 pub fn draw(
     buf: &mut [u8],
@@ -115,46 +151,82 @@ pub fn draw(
     rows: &[Row],
     padding: u32,
     colors: &Colors,
+    scale: u32,
+    caret_visible: bool,
+    subpixel: Subpixel,
 ) {
+    let s = scale.max(1);
     let row_h = font.row_h;
-    let p = padding;
+    // Buffer-pixel geometry derived from the logical constants.
+    let p = padding * s;
+    let corner = CORNER_RADIUS * s;
+    let rail_w = LABEL_RAIL_W * s;
+    let vpad = PILL_VPAD * s;
+    let gap = PROMPT_GAP * s as f32;
     // `-P` masks the typed text; filtering still sees the real query.
     let query = masked_input(query, password);
 
     // Panel: rounded corners (transparent outside), input bar and list sharing
     // one outline, separated only by the subtle background difference.
-    let r = CORNER_RADIUS.min(h / 2);
-    fill(buf, w, h, [0, 0, 0, 0]);
+    // One pass, one write per pixel. The buffer can be a different slot each
+    // frame, so pixels outside the rounded outline must be written too — but the
+    // panel itself must not be painted twice (that second full-buffer write was
+    // the bulk of a HiDPI frame: 4.8 ms at scale 2 with 64 rows).
+    let r = corner.min(h / 2);
     for y in 0..h {
         let (x0, x1) = rounded_span(w, h, r, y);
         let bg = if y < row_h { colors.bg_prompt } else { colors.bg_normal };
+        if x0 > 0 {
+            set_span(buf, w, y, 0, x0, CLEAR);
+        }
         set_span(buf, w, y, x0, x1, bg);
+        if x1 < w {
+            set_span(buf, w, y, x1, w, CLEAR);
+        }
     }
 
     // Prompt / input row text.
     let baseline = row_baseline(font, 0);
-    // The prompt label ("address") gets a distinct background strip, clipped to
-    // the rounded outline like the selection band below.
+    // The prompt label ("address") sits on a compact capsule, rounded on both
+    // sides, so the bar background stays uniformly bg_prompt (identical to the
+    // normal, prompt-less input bar).
     let mut x = p as f32;
     if !prompt.is_empty() {
-        let label_end = (p + measure(font, prompt, (w - 2 * p) as f32) as u32).min(w);
-        for yy in 0..row_h.min(h) {
-            let (x0, x1) = rounded_span(w, h, r, yy);
-            set_span(buf, w, yy, x0, x1.min(label_end), colors.bg_label);
-        }
-        x = draw_text(buf, w, h, font, p as f32, baseline, prompt, colors.fg_prompt, (w - 2 * p) as f32);
+        // Option F: a 4px accent rail on the bar's left edge, the label text
+        // 8px past it — no enclosing shape, so the bar stays uniformly
+        // bg_prompt and the visual mass is minimal.
+        let rail_h = font.line_h.ceil() as u32 + 2 * vpad;
+        let rail_y = (font.row_h - rail_h) / 2;
+        rect(buf, w, h, p, rail_y, rail_w, rail_h, colors.label_accent);
+        x = draw_text(
+            buf,
+            w,
+            h,
+            font,
+            p as f32 + rail_w as f32 + gap,
+            baseline,
+            prompt,
+            colors.fg_prompt,
+            (w - 2 * p) as f32,
+            subpixel,
+        );
+        // Eye-comfort: fixed on-grid gap between the label text and the first
+        // typed character — missing inter-element spacing increases regressive
+        // fixations (Rayner et al.).
+        x += gap;
     }
     if !query.is_empty() {
-        x = draw_text(buf, w, h, font, x, baseline, &query, colors.fg_prompt, w as f32 - x - p as f32);
+        x = draw_text(buf, w, h, font, x, baseline, &query, colors.fg_prompt, w as f32 - x - p as f32, subpixel);
     }
     // caret: 2px bar after the input text, spanning the text's ascent→descent
     // block (descent_px is negative in ab_glyph, so text bottom = baseline - descent).
-    let caret_x = x as u32 + 1;
+    let caret_w = 2 * s;
+    let caret_x = x as u32 + s;
     let caret_bottom = (baseline - font.descent_px).round() as u32;
     let caret_h = font.line_h.ceil() as u32;
-    if caret_bottom > 0 {
+    if caret_visible && caret_bottom > 0 {
         let caret_top = caret_bottom.saturating_sub(caret_h);
-        rect(buf, w, h, caret_x.min(w - 2), caret_top, 2, caret_bottom - caret_top, colors.fg_prompt);
+        rect(buf, w, h, caret_x.min(w.saturating_sub(caret_w)), caret_top, caret_w, caret_bottom - caret_top, colors.fg_prompt);
     }
 
     // Item rows (background already bg_normal from the panel pass; only the
@@ -168,16 +240,11 @@ pub fn draw(
             }
         }
         let (_, fg) = if row.selected { (colors.bg_sel, colors.fg_sel) } else { (colors.bg_normal, colors.fg_normal) };
-        draw_text(buf, w, h, font, p as f32, row_baseline(font, y), row.text, fg, w as f32 - 2.0 * p as f32);
+        draw_text(buf, w, h, font, p as f32, row_baseline(font, y), row.text, fg, w as f32 - 2.0 * p as f32, subpixel);
     }
 }
 
-pub fn fill(buf: &mut [u8], w: u32, h: u32, color: Bgra) {
-    for px in buf[..(w * h * 4) as usize].chunks_exact_mut(4) {
-        px.copy_from_slice(&color);
-    }
-}
-
+#[allow(clippy::too_many_arguments)]
 pub fn rect(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, rw: u32, rh: u32, color: Bgra) {
     let x0 = (x as i64).clamp(0, w as i64) as u32;
     let y0 = (y as i64).clamp(0, h as i64) as u32;
@@ -191,8 +258,37 @@ pub fn rect(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, rw: u32, rh: u32, co
     }
 }
 
+/// Antialiasing mode for text. LCD subpixel modes sample coverage in three
+/// horizontal sub-columns and feed them to R, G and B separately, which is
+/// noticeably sharper on 1× displays; `Gray` is neutral (no colour fringing)
+/// and is what `Bgr` exists for — panels wired blue-green-red need the mirror.
+/// `Gray`/`Bgr` are only reachable by changing `main::TEXT_AA`, but both are
+/// covered by tests (and are the documented escape hatches), so they are not
+/// dead code.
+#[allow(dead_code)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subpixel {
+    Gray,
+    Rgb,
+    Bgr,
+}
+
+/// Subpixel sample offsets, in pixels, inside one pixel column.
+const SUBPIXEL_SAMPLES: f32 = 3.0;
+/// BGRA byte index for the red, green and blue channels.
+const RGB_CHAN: [usize; 3] = [2, 1, 0];
+const BGR_CHAN: [usize; 3] = [0, 1, 2];
+
+/// Subpixel buckets per pixel: glyphs are rasterized per bucket, so pen
+/// positioning stays subpixel-accurate and still cacheable.
+const BUCKETS_PER_PX: f32 = 4.0;
+/// Glyph cache cap; a script with thousands of distinct glyphs resets it
+/// (costing one frame) instead of growing without bound.
+const GLYPH_CACHE_CAP: usize = 8192;
+
 /// Draw `s` starting at (x, baseline), clipped to `max_w` px wide.
 /// Returns the x position just past the last drawn advance.
+#[allow(clippy::too_many_arguments)]
 pub fn draw_text(
     buf: &mut [u8],
     w: u32,
@@ -203,45 +299,72 @@ pub fn draw_text(
     s: &str,
     color: Bgra,
     max_w: f32,
+    subpixel: Subpixel,
 ) -> f32 {
     let scale = || PxScale::from(font.size);
     let mut cx = x;
     let end = x + max_w;
+    let mode = match subpixel {
+        Subpixel::Gray => 0,
+        Subpixel::Rgb => 1,
+        Subpixel::Bgr => 2,
+    };
+    let bucket = |v: f32| ((v.fract() * BUCKETS_PER_PX) as u8).min(BUCKETS_PER_PX as u8 - 1);
+    let canonical = |v: f32| (v.fract() * BUCKETS_PER_PX).floor() / BUCKETS_PER_PX;
     'ch: for ch in s.chars() {
         // Walk the face chain (primary first); draw with the first face that
         // has this glyph so CJK etc. fall back to a system font.
-        for face in std::iter::once(&font.font).chain(font.fallbacks.iter()) {
+        for (face_idx, face) in std::iter::once(&font.font).chain(font.fallbacks.iter()).enumerate() {
             let scaled = face.as_scaled(scale());
             let gid = scaled.glyph_id(ch);
             if gid == GlyphId(0) {
                 continue; // no glyph in this face, try the next
             }
-            let adv = scaled.h_advance(gid);
-            if cx + adv > end {
+            let advance = scaled.h_advance(gid);
+            if cx + advance > end {
                 break 'ch;
             }
-            if let Some(outline) =
-                face.outline_glyph(Glyph { id: gid, scale: scale(), position: point(cx, baseline) })
-            {
-                let b = outline.px_bounds();
-                outline.draw(|gx, gy, cov| {
-                    let px = b.min.x as i32 + gx as i32;
-                    let py = b.min.y as i32 + gy as i32;
-                    if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
-                        return;
+            let key: crate::font::GlyphKey =
+                (face_idx as u8, gid.0, bucket(cx), bucket(baseline), mode);
+            if !font.glyphs.borrow().contains_key(&key) {
+                if font.glyphs.borrow().len() >= GLYPH_CACHE_CAP {
+                    font.glyphs.borrow_mut().clear();
+                }
+                // Rasterize at the canonical pen (subpixel part only), then blit
+                // at the whole-pixel part — the two differ by an integer shift.
+                let planes = match subpixel {
+                    // One neutral plane, used for every channel.
+                    Subpixel::Gray => {
+                        vec![raster(face, gid, scale(), point(canonical(cx), canonical(baseline)))]
                     }
-                    let a = (cov * color[3] as f32).round() as u32;
-                    if a == 0 {
-                        return;
-                    }
-                    blend_px(
-                        &mut buf[((py as u32 * w + px as u32) * 4) as usize..][..4],
-                        [color[0], color[1], color[2]],
-                        a,
-                    );
-                });
+                    // One plane per subpixel column: each carries one channel.
+                    _ => (0..3)
+                        .map(|k| {
+                            let off = k as f32 / SUBPIXEL_SAMPLES;
+                            raster(face, gid, scale(), point(canonical(cx) + off, canonical(baseline)))
+                        })
+                        .collect(),
+                };
+                font.glyphs.borrow_mut().insert(key, crate::font::GlyphBitmap { advance, planes });
             }
-            cx += adv;
+            let cache = font.glyphs.borrow();
+            let bmp = cache.get(&key).expect("inserted above");
+            let dx = cx.floor() as i32;
+            let dy = baseline.floor() as i32;
+            match subpixel {
+                Subpixel::Gray => blit_plane(buf, w, h, &bmp.planes[0], dx, dy, color, None),
+                Subpixel::Rgb => {
+                    for (k, plane) in bmp.planes.iter().enumerate() {
+                        blit_plane(buf, w, h, plane, dx, dy, color, Some(RGB_CHAN[k]));
+                    }
+                }
+                Subpixel::Bgr => {
+                    for (k, plane) in bmp.planes.iter().enumerate() {
+                        blit_plane(buf, w, h, plane, dx, dy, color, Some(BGR_CHAN[k]));
+                    }
+                }
+            }
+            cx += bmp.advance;
             continue 'ch;
         }
         // No face in the chain has this glyph; skip it silently.
@@ -250,8 +373,9 @@ pub fn draw_text(
 }
 
 /// Advance width of `s` under the same face-chain + fit rules as `draw_text`
-/// (returns the extent starting at 0, capped at `max_w`). Kept in lockstep
-/// with `draw_text`'s per-glyph fit break.
+/// (returns the extent starting at 0, capped at `max_w`). Test-only: the F-rail
+/// layout no longer needs it in `draw`, but the geometry tests do.
+#[cfg(test)]
 fn measure(font: &crate::font::MenuFont, s: &str, max_w: f32) -> f32 {
     let scale = || PxScale::from(font.size);
     let mut cx = 0.0;
@@ -276,6 +400,63 @@ fn measure(font: &crate::font::MenuFont, s: &str, max_w: f32) -> f32 {
 fn row_baseline(font: &crate::font::MenuFont, row_y: u32) -> f32 {
     let top = row_y as f32 + (font.row_h as f32 - font.line_h) / 2.0;
     top + font.ascent_px
+}
+
+/// Rasterize one coverage plane of `gid` at `pos`.
+fn raster(
+    face: &ab_glyph::FontVec,
+    gid: GlyphId,
+    scale: PxScale,
+    pos: ab_glyph::Point,
+) -> crate::font::GlyphPlane {
+    let Some(outline) = face.outline_glyph(Glyph { id: gid, scale, position: pos }) else {
+        return crate::font::GlyphPlane::default();
+    };
+    let b = outline.px_bounds();
+    // px_bounds is an f32 rect and `draw` iterates width()×height() from `min`,
+    // so both must stay in the same units.
+    let (w, h) = (b.width() as u32, b.height() as u32);
+    let mut coverage = Vec::with_capacity((w * h) as usize);
+    outline.draw(|_, _, cov| coverage.push((cov * 255.0).round() as u8));
+    crate::font::GlyphPlane { min_x: b.min.x as i32, min_y: b.min.y as i32, w, h, coverage }
+}
+
+/// Blend one coverage plane: across all channels (grayscale AA, `chan = None`)
+/// or into a single channel (LCD subpixel AA). Subpixel planes touch disjoint
+/// channels, so blending them in sequence is exact.
+#[allow(clippy::too_many_arguments)]
+fn blit_plane(
+    buf: &mut [u8],
+    w: u32,
+    h: u32,
+    plane: &crate::font::GlyphPlane,
+    dx: i32,
+    dy: i32,
+    color: Bgra,
+    chan: Option<usize>,
+) {
+    for gy in 0..plane.h {
+        for gx in 0..plane.w {
+            let cov = plane.coverage[(gy * plane.w + gx) as usize];
+            if cov == 0 {
+                continue;
+            }
+            let px = dx + plane.min_x + gx as i32;
+            let py = dy + plane.min_y + gy as i32;
+            if px < 0 || py < 0 || px >= w as i32 || py >= h as i32 {
+                continue;
+            }
+            let a = (cov as u32 * color[3] as u32) / 255;
+            if a == 0 {
+                continue;
+            }
+            let dst = &mut buf[((py as u32 * w + px as u32) * 4) as usize..][..4];
+            match chan {
+                None => blend_px(dst, [color[0], color[1], color[2]], a),
+                Some(c) => dst[c] = ((color[c] as u32 * a + dst[c] as u32 * (255 - a)) / 255) as u8,
+            }
+        }
+    }
 }
 
 /// `-P` password mode: one asterisk per char; otherwise return the query unchanged.
@@ -310,7 +491,7 @@ mod tests {
             Row { text: "Terminal", selected: false },
             Row { text: "Settings", selected: false },
         ];
-        draw(&mut buf, w, h, &font, "run: ", "fir", false, &rows, crate::PAD, &colors);
+        draw(&mut buf, w, h, &font, "run: ", "fir", false, &rows, crate::PAD, &colors, 1, true, Subpixel::Gray);
 
         // Selected row (rows[0]) has the selection background.
         let sel_px = &buf[(font.row_h * 1 * w + w / 2) as usize * 4..][..4];
@@ -333,10 +514,57 @@ mod tests {
             }
         }
         assert!(text_has_ink, "text should be drawn over the selection row");
+    }
 
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/frame-demo.bgra");
-        std::fs::write(&out, &buf).expect("raw frame written");
-        assert!(out.exists() && out.metadata().unwrap().len() > 1000);
+    /// LCD subpixel AA: three planes feed R, G and B separately, so channel
+    /// differences appear; `Bgr` is the mirror of `Rgb`; `Gray` stays neutral.
+    #[test]
+    fn subpixel_aa_is_per_channel_and_order_symmetric() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (240u32, font.row_h);
+        let render = |aa: Subpixel| {
+            let mut buf = vec![0u8; (w * h * 4) as usize];
+            draw(&mut buf, w, h, &font, "", "firim", false, &[], crate::PAD, &Colors::default(), 1, true, aa);
+            buf
+        };
+        let gray = render(Subpixel::Gray);
+        let rgb = render(Subpixel::Rgb);
+        let bgr = render(Subpixel::Bgr);
+
+        assert_ne!(gray, rgb, "subpixel AA must change the rendering");
+        assert!(
+            gray.chunks_exact(4).all(|p| p[0] == p[2]),
+            "grayscale AA must stay colour-neutral"
+        );
+        assert!(
+            rgb.chunks_exact(4).any(|p| p[0] != p[2]),
+            "RGB subpixel AA must produce channel differences"
+        );
+        // BGR is RGB with red and blue swapped, green untouched.
+        for (a, b) in rgb.chunks_exact(4).zip(bgr.chunks_exact(4)) {
+            assert_eq!(a[0], b[2], "blue and red are mirrored");
+            assert_eq!(a[2], b[0]);
+            assert_eq!(a[1], b[1], "green is shared");
+        }
+    }
+
+    /// The glyph cache must render identically on the second frame and add no
+    /// entries: it is reused, not just populated.
+    #[test]
+    fn glyph_cache_is_reused_across_frames() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (320u32, font.row_h * 2);
+        let colors = Colors::default();
+        let rows = [Row { text: "Firefox 火狐", selected: true }];
+        let mut a = vec![0u8; (w * h * 4) as usize];
+        draw(&mut a, w, h, &font, "run:", "fir", false, &rows, crate::PAD, &colors, 1, true, Subpixel::Gray);
+        let cached = font.glyphs.borrow().len();
+        assert!(cached > 0, "the first frame must populate the cache");
+
+        let mut b = vec![0u8; (w * h * 4) as usize];
+        draw(&mut b, w, h, &font, "run:", "fir", false, &rows, crate::PAD, &colors, 1, true, Subpixel::Gray);
+        assert_eq!(a, b, "cached glyphs must render exactly as the first frame");
+        assert_eq!(font.glyphs.borrow().len(), cached, "reuse adds no entries");
     }
 
     /// Render check: latin-only primary face, CJK must still draw via fallback.
@@ -345,7 +573,7 @@ mod tests {
         let font = MenuFont::load(Some("Noto Sans Mono"), 16.0).expect("system font available");
         let (w, h) = (320u32, font.row_h);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        draw(&mut buf, w, h, &font, "", "火狐", false, &[], crate::PAD, &Colors::default());
+        draw(&mut buf, w, h, &font, "", "火狐", false, &[], crate::PAD, &Colors::default(), 1, true, Subpixel::Gray);
         // Prompt row bg is BG_PROMPT; any pixel differing from it is glyph ink.
         let bg = Colors::default().bg_prompt;
         let mut ink = false;
@@ -367,7 +595,7 @@ mod tests {
         let (w, h) = (200u32, font.row_h * 3);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let colors = Colors::default();
-        draw(&mut buf, w, h, &font, "", "fir", false, &[], crate::PAD, &colors);
+        draw(&mut buf, w, h, &font, "", "fir", false, &[], crate::PAD, &colors, 1, true, Subpixel::Gray);
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
 
         // All four corner pixels are fully transparent.
@@ -406,7 +634,7 @@ mod tests {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (200u32, font.row_h * 2);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        draw(&mut buf, w, h, &font, "", "x", false, &[Row { text: "app", selected: false }], crate::PAD, &def);
+        draw(&mut buf, w, h, &font, "", "x", false, &[Row { text: "app", selected: false }], crate::PAD, &def, 1, true, Subpixel::Gray);
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
         // Input bar row uses bg_prompt, the list row below it bg_normal.
         assert_eq!(px(w / 2, 2), &def.bg_prompt);
@@ -414,26 +642,88 @@ mod tests {
     }
 
     #[test]
-    fn prompt_label_has_distinct_background_from_input_area() {
+    fn prompt_label_is_a_left_rail_over_an_uniform_bar() {
         let def = Colors::default();
-        assert_ne!(def.bg_label, def.bg_prompt, "label strip must differ from input area");
+        assert_ne!(def.label_accent, def.bg_prompt, "label accent must differ from the bar");
 
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h);
         let mut buf = vec![0u8; (w * h * 4) as usize];
-        draw(&mut buf, w, h, &font, "address", "", false, &[], crate::PAD, &def);
-        let mid = font.row_h / 2;
-        let px = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
-        // Behind the prompt text: label strip; right of it: input bar color.
-        assert_eq!(px(crate::PAD), &def.bg_label);
-        let label_end = crate::PAD + measure(&font, "address", (w - 2 * crate::PAD) as f32) as u32;
-        // +8 clears any antialiased bleed past the last glyph's advance.
-        assert_eq!(px(label_end + 8), &def.bg_prompt);
+        draw(&mut buf, w, h, &font, "address", "", false, &[], crate::PAD, &def, 1, true, Subpixel::Gray);
+        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
 
-        // Empty prompt → no strip; the whole bar stays bg_prompt.
+        let rail_h = font.line_h.ceil() as u32 + 2 * PILL_VPAD;
+        let rail_y = (font.row_h - rail_h) / 2;
+        let mid = font.row_h / 2;
+
+        // A 4px rail sits flush on the bar's left padding; everything else —
+        // just past the rail, between rail and label text, and the far right —
+        // is bg_prompt, so the bar reads like the normal, prompt-less input bar.
+        assert_eq!(px(crate::PAD, mid), &def.label_accent, "rail left edge");
+        assert_eq!(px(crate::PAD + LABEL_RAIL_W - 1, mid), &def.label_accent, "rail right edge");
+        assert_eq!(px(crate::PAD + LABEL_RAIL_W, mid), &def.bg_prompt, "just past the rail");
+        assert_eq!(px(crate::PAD + 8, mid), &def.bg_prompt, "between rail and label text");
+        assert_eq!(px(w - 10, mid), &def.bg_prompt);
+        // Rail is vertically centered at the same height the capsule had.
+        assert_eq!(px(crate::PAD, rail_y), &def.label_accent, "rail top");
+        assert_eq!(px(crate::PAD, rail_y - 1), &def.bg_prompt, "above the rail");
+        assert_eq!(px(crate::PAD, rail_y + rail_h), &def.bg_prompt, "below the rail");
+
+        // Empty prompt → no rail; the whole bar stays bg_prompt.
         let mut buf2 = vec![0u8; (w * h * 4) as usize];
-        draw(&mut buf2, w, h, &font, "", "x", false, &[], crate::PAD, &def);
+        draw(&mut buf2, w, h, &font, "", "x", false, &[], crate::PAD, &def, 1, true, Subpixel::Gray);
         assert_eq!(&buf2[((mid * w + crate::PAD) * 4) as usize..][..4], &def.bg_prompt);
+    }
+
+    /// Caret hidden while blinked off: no solid fg_prompt column.
+    #[test]
+    fn caret_can_be_hidden_for_blinking() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (200u32, font.row_h);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let colors = Colors::default();
+        draw(&mut buf, w, h, &font, "", "fir", false, &[], crate::PAD, &colors, 1, false, Subpixel::Gray);
+        let mid = font.row_h / 2;
+        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let solid = (1..w - 3)
+            .any(|x| px(x, mid) == &colors.fg_prompt && px(x + 1, mid) == &colors.fg_prompt);
+        assert!(!solid, "blinked-off caret must not be drawn");
+    }
+
+    #[test]
+    fn scroll_thumb_only_when_overflowing_and_tracks_position() {
+        assert_eq!(scroll_thumb(24, 240, 10, 10, 0), None, "no overflow, no indicator");
+        assert_eq!(scroll_thumb(24, 240, 10, 0, 0), None, "empty list");
+        assert_eq!(scroll_thumb(24, 0, 10, 100, 0), None, "collapsed bar has no track");
+        let (y0, h0) = scroll_thumb(24, 240, 10, 100, 0).expect("overflows");
+        assert_eq!(y0, 24, "at the top the thumb starts at the track top");
+        assert_eq!(h0, 24, "length tracks the visible/total ratio");
+        let (y1, h1) = scroll_thumb(24, 240, 10, 100, 90).expect("overflows");
+        assert_eq!(y1 + h1, 24 + 240, "at the end the thumb ends at the track bottom");
+        let (ym, hm) = scroll_thumb(24, 240, 10, 100, 45).expect("overflows");
+        assert!(ym > y0 && ym < y1, "mid-scroll sits between the ends");
+        assert_eq!(hm, h0);
+    }
+
+    /// HiDPI: geometry constants are logical and scale with the buffer density.
+    #[test]
+    fn hidpi_scale_doubles_the_buffer_geometry() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (480u32, font.row_h * 2);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let def = Colors::default();
+        draw(&mut buf, w, h, &font, "address", "", false, &[], crate::PAD, &def, 2, true, Subpixel::Gray);
+        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+        let mid = font.row_h / 2;
+
+        // Padding 12 -> 24, rail width 4 -> 8.
+        let rail_x = crate::PAD * 2;
+        assert_eq!(px(rail_x, mid), &def.label_accent, "rail starts at scaled padding");
+        assert_eq!(px(rail_x + 2 * LABEL_RAIL_W - 1, mid), &def.label_accent, "rail is 2x wide");
+        assert_eq!(px(rail_x + 2 * LABEL_RAIL_W, mid), &def.bg_prompt, "past the scaled rail");
+        // Panel corner radius 10 -> 20: the first buffer row is inset further.
+        let (x0, _) = rounded_span(w, h, CORNER_RADIUS * 2, 0);
+        assert!(x0 > CORNER_RADIUS, "corner inset scales with density: {x0}");
     }
 
     #[test]
@@ -456,10 +746,8 @@ mod tests {
         );
         // Content inset must clear the corner radius so text never grazes the curve.
         // (Constants: these are compile-time guards for the comfort rules.)
-        #[allow(clippy::assertions_on_constants)]
         assert!(crate::PAD >= CORNER_RADIUS, "PAD {} < radius {}", crate::PAD, CORNER_RADIUS);
         // Away from the screen edge: top margin is a comfortable float, not a hug.
-        #[allow(clippy::assertions_on_constants)]
         assert!(crate::TOP_MARGIN >= 32, "top margin too tight");
     }
 
@@ -492,7 +780,7 @@ mod caret_tests {
         let (w, h) = (200u32, font.row_h);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let colors = Colors::default();
-        draw(&mut buf, w, h, &font, "", "fir", false, &[], crate::PAD, &colors);
+        draw(&mut buf, w, h, &font, "", "fir", false, &[], crate::PAD, &colors, 1, true, Subpixel::Gray);
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
 
         // A solid (non-antialiased) 2px-wide fg_prompt column = the caret;
@@ -523,6 +811,42 @@ mod caret_tests {
         }
         assert_eq!(top, Some(top_expected), "caret must start at the text block top");
         assert_eq!(bottom, Some(top_expected + line_h - 1), "caret must span the full text block");
+    }
+
+    #[test]
+    fn prompt_gap_separates_pill_from_input() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (300u32, font.row_h);
+        let colors = Colors::default();
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        // Locate the solid 2px caret (same detector as the test above) for a
+        // given prompt; the query "fir" and caret stay identical in both frames.
+        let mut caret_x = |prompt: &str| -> u32 {
+            buf.fill(0);
+            draw(&mut buf, w, h, &font, prompt, "fir", false, &[], crate::PAD, &colors, 1, true, Subpixel::Gray);
+            let mid = font.row_h / 2;
+            let at = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
+            for x in 1..w - 3 {
+                if at(x) == &colors.fg_prompt && at(x + 1) == &colors.fg_prompt
+                    && at(x - 1) != &colors.fg_prompt && at(x + 2) != &colors.fg_prompt
+                {
+                    return x;
+                }
+            }
+            panic!("caret not found for prompt {prompt:?}");
+        };
+        // With a prompt, the caret shifts right by the prompt's advance plus
+        // the pill's two horizontal paddings and the inter-element gap; without
+        // one it starts straight at the padding. f32 sums can round the
+        // measured delta up by one pixel.
+        let advance = measure(&font, "run:", (w - 2 * crate::PAD) as f32) as u32;
+        // Rail (4px) + label gap (8px) + inter-element gap (8px).
+        let separators = (LABEL_RAIL_W as f32 + 2.0 * PROMPT_GAP) as u32;
+        let delta = caret_x("run:") - caret_x("") - advance;
+        assert!(
+            (separators..=separators + 1).contains(&delta),
+            "label and input must be separated by ~{separators}px, got {delta}"
+        );
     }
 }
 
