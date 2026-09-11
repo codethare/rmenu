@@ -63,3 +63,11 @@
 - [x] 5 高度过渡动画（120 ms 缓出；起始/终点/单调断言）
 - [x] 6 `Keywords=` 参与匹配（不影响排序）
 - [x] 回归：70 passed；clippy 0；release 通过；README 说明子像素与 BGR 逃生门
+# Todo: contrast-viewport-tryexec（1/3/4 + 5 部分）
+
+- [x] 1 选中行 `bg_sel #0b6285` + 白字（6.77:1）；WCAG 回归测试
+- [x] 3 视口纯函数 `viewport_top` + 7 条断言；修掉陈旧 offset 越界风险
+- [x] 4 `TryExec` 缺失即隐藏（绝对路径/`$PATH`/符号链接）
+- [x] 5a 抽出 `anim.rs`、`feed.rs`（`pub(crate)` + 测试随行）
+- [ ] 5b 抽出 `opts.rs`、`menu.rs`（需字段放权 + 拆测试辅助，下一轮）
+- [x] 回归：73 passed；clippy 0；fmt clean

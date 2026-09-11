@@ -34,8 +34,11 @@ pub const FG_PROMPT: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
 /// deep slate blue that carries the emphasis while staying harmonious with the
 /// gray bar and apart from the selection blue.
 pub const LABEL_ACCENT: Bgra = bgra(0x2e, 0x4a, 0x5c, 0xff);
-pub const BG_SEL: Bgra = bgra(0x0f, 0x7c, 0xa6, 0xff);
-pub const FG_SEL: Bgra = bgra(0xee, 0xee, 0xee, 0xff);
+/// Selected row. The background is darker than the old `0f7ca6` so white text
+/// clears WCAG AA: `#ffffff` on `#0b6285` is 6.77:1 (the previous pair was
+/// 4.06:1 — the weakest contrast in the whole UI, on the row that matters most).
+pub const BG_SEL: Bgra = bgra(0x0b, 0x62, 0x85, 0xff);
+pub const FG_SEL: Bgra = bgra(0xff, 0xff, 0xff, 0xff);
 
 /// Menu color scheme, wmenu-style (defaults match the old hardcoded constants).
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -973,6 +976,43 @@ mod tests {
         let (ym, hm) = scroll_thumb(24, 240, 10, 100, 45).expect("overflows");
         assert!(ym > y0 && ym < y1, "mid-scroll sits between the ends");
         assert_eq!(hm, h0);
+    }
+
+    /// WCAG relative luminance of an opaque BGRA pixel (index 0 is blue).
+    fn luminance(px: Bgra) -> f64 {
+        let chan = |c: u8| {
+            let c = c as f64 / 255.0;
+            if c <= 0.03928 {
+                c / 12.92
+            } else {
+                ((c + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * chan(px[2]) + 0.7152 * chan(px[1]) + 0.0722 * chan(px[0])
+    }
+
+    fn contrast(a: Bgra, b: Bgra) -> f64 {
+        let (x, y) = (luminance(a), luminance(b));
+        let (hi, lo) = if x > y { (x, y) } else { (y, x) };
+        (hi + 0.05) / (lo + 0.05)
+    }
+
+    /// The palette is what users actually read. The selected row used to sit at
+    /// 4.06:1 (below WCAG AA) while every other pair was above 8:1.
+    #[test]
+    fn default_palette_meets_wcag_aa_for_text() {
+        let c = Colors::default();
+        for (name, fg, bg) in [
+            ("normal", c.fg_normal, c.bg_normal),
+            ("prompt", c.fg_prompt, c.bg_prompt),
+            ("selected", c.fg_sel, c.bg_sel),
+        ] {
+            let r = contrast(fg, bg);
+            assert!(
+                r >= 4.5,
+                "{name} text contrast {r:.2}:1 is below WCAG AA (4.5:1)"
+            );
+        }
     }
 
     /// HiDPI: geometry constants are logical and scale with the buffer density.

@@ -120,6 +120,19 @@
 - “属性/注释紧跟函数”又踩两次（allow 被新常量挤开；删 fill 连带删了 rect 的 allow）——已修
 
 验证检查点：70 passed；clippy 0；配对基准（gray vs rgb）记录在 SPEC。
+# Plan: contrast-viewport-tryexec（1/3/4 + 5 部分）
+
+1. sel-contrast（render.rs）：`BG_SEL 0f7ca6 → 0b6285`、`FG_SEL eeeeee → ffffff`；新增 WCAG 对比度回归测试（相对亮度公式，三组 fg/bg 断言 ≥4.5:1）
+2. viewport-tests（main.rs）：把 draw() 内联的滚动窗口算法抽成 `viewport_top(sel, top, visible, total)`；`else` 分支 clamp `max_top`（修掉列表收缩后可能越界 panic）；7 条断言
+3. tryexec（desktop.rs）：CHECK_KEYS + 解析 + `try_exec_ok`（绝对路径直接查、否则查 `$PATH`，均跟随符号链接）；测试含不存在名字/路径
+4. split-modules（脚本按块搬移，保证逐字一致）：抽 `anim.rs`（Anim + 测试）、`feed.rs`（ItemFeed + 测试）；两者对外改 `pub(crate)`，main.rs 加 `mod`/`use`
+
+风险与取舍：
+
+- 抽取后 main.rs 1525 行（原 1643）：anim/feed 是低耦合块，先确保安全；opts/menu 需给字段放权与拆测试辅助，留待下一轮
+- rustfmt 已重排过代码，多个 oldText 因多行 assert 失效——编辑前先看实际文本
+
+验证检查点：73 passed；clippy 0；fmt clean；`TryExec`/对比度/视口均有独立断言。
 # Plan: prompt-badge-r2
 
 确认范围：不做「固定槽位/坐标一致」（否决）；只做三件：

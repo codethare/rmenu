@@ -20,6 +20,7 @@ const CHECK_KEYS: &[&str] = &[
     "NotShowIn",
     "Terminal",
     "Keywords",
+    "TryExec",
 ];
 
 /// All application directories per the freedesktop spec, lowest to highest priority.
@@ -86,6 +87,7 @@ fn parse_desktop(path: &Path) -> Option<App> {
     let mut only_show = None;
     let mut not_show = None;
     let mut keywords = String::new();
+    let mut try_exec = None;
     for line in text.lines() {
         let line = line.trim();
         if line.starts_with('[') {
@@ -117,6 +119,7 @@ fn parse_desktop(path: &Path) -> Option<App> {
             // `;`-separated; keep the separators so "web browser" does not
             // match across two keywords.
             "Keywords" => keywords = value.to_lowercase(),
+            "TryExec" => try_exec = Some(value.to_string()),
             _ => {}
         }
     }
@@ -127,6 +130,12 @@ fn parse_desktop(path: &Path) -> Option<App> {
     }
     let current = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
     if !shown_on(only_show.as_deref(), not_show.as_deref(), &current) {
+        return None;
+    }
+    // `TryExec` is the spec's "is this actually installed?" check.
+    if let Some(t) = &try_exec
+        && !try_exec_ok(t)
+    {
         return None;
     }
     let name = pick_name(&locale_tags(), &localized, name)?;
@@ -169,6 +178,27 @@ fn pick_name(
 /// freedesktop visibility: `OnlyShowIn`/`NotShowIn` hold `;`-separated desktop
 /// names, compared against `XDG_CURRENT_DESKTOP` (`:`-separated, e.g.
 /// `sway:wlroots`). An empty current desktop means "do not filter".
+/// `.desktop` `TryExec=`: hide the entry when that executable is not runnable.
+/// An absolute path is checked directly; a bare name is looked up in `$PATH`.
+fn try_exec_ok(cmd: &str) -> bool {
+    let runs = |p: &Path| {
+        std::fs::metadata(p)
+            .map(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+            .unwrap_or(false)
+    };
+    if cmd.is_empty() {
+        return true;
+    }
+    if cmd.contains('/') {
+        return runs(Path::new(cmd));
+    }
+    std::env::var("PATH")
+        .unwrap_or_default()
+        .split(':')
+        .filter(|d| !d.is_empty())
+        .any(|dir| runs(&Path::new(dir).join(cmd)))
+}
+
 fn shown_on(only: Option<&str>, not: Option<&str>, current: &str) -> bool {
     let current: Vec<&str> = current.split(':').filter(|s| !s.is_empty()).collect();
     if current.is_empty() {
@@ -396,6 +426,14 @@ mod legacy_tests {
     }
 
     #[test]
+    fn try_exec_hides_entries_whose_binary_is_missing() {
+        assert!(try_exec_ok(""), "no TryExec means no constraint");
+        assert!(try_exec_ok("sh"), "sh is in PATH");
+        assert!(!try_exec_ok("rmenu-definitely-not-installed-xyz"));
+        assert!(!try_exec_ok("/nonexistent/dir/binary"));
+    }
+
+    #[test]
     fn desktop_visibility_filters_by_current_desktop() {
         assert!(
             !shown_on(Some("GNOME;"), None, "sway:wlroots"),
@@ -457,6 +495,12 @@ mod legacy_tests {
             parse_desktop(&df).is_some(),
             shown_on(Some("GNOME;"), None, &current)
         );
+        std::fs::write(
+            &df,
+            "[Desktop Entry]\nName=Missing Bin\nExec=ghost\nTryExec=rmenu-definitely-not-installed-xyz\n",
+        )
+        .unwrap();
+        assert!(parse_desktop(&df).is_none(), "TryExec hid a missing binary");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

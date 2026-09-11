@@ -3,17 +3,18 @@
 //! Plain text or `--run` launcher mode. `--run` scans .desktop files;
 //! otherwise lines are read from stdin.
 
+mod anim;
 mod desktop;
+mod feed;
 mod font;
 mod items;
 mod render;
 
-use std::io::{self, BufRead};
+use anim::Anim;
+use feed::ItemFeed;
+
 use std::process::exit;
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smithay_client_toolkit::reexports::calloop::EventLoop;
@@ -64,30 +65,6 @@ const MAX_WIDTH: u32 = 16384;
 const MAX_LINES: usize = 1000;
 /// Caret blink half-period; typing resets it to visible.
 const BLINK_PERIOD: Duration = Duration::from_millis(500);
-/// Height transition length for expand/collapse (Spotlight-style).
-const ANIM: Duration = Duration::from_millis(120);
-
-/// Height transition: ease-out cubic from `from` to `to`, in buffer pixels.
-/// Frame cost is ~2 ms even at 64 rows, so animating is affordable.
-struct Anim {
-    from: u32,
-    to: u32,
-    start: Instant,
-}
-
-impl Anim {
-    /// Current height plus whether the transition is still running.
-    fn height(&self, now: Instant) -> (u32, bool) {
-        let t = now.saturating_duration_since(self.start).as_secs_f32() / ANIM.as_secs_f32();
-        if t >= 1.0 {
-            return (self.to, false);
-        }
-        let e = 1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(3);
-        let h = self.from as f32 + (self.to as f32 - self.from as f32) * e;
-        (h.round().max(0.0) as u32, true)
-    }
-}
-
 struct Opts {
     prompt: String,
     width: u32,
@@ -340,6 +317,26 @@ fn main() {
     app.finish();
 }
 
+/// Top row of the visible window: keeps the selection in view with `SCROLLOFF`
+/// rows of context on each side, using the previous top as hysteresis so the
+/// list does not jitter while the selection moves inside the window. Pure, so
+/// it is testable without a compositor.
+fn viewport_top(sel: usize, top: usize, visible: usize, total: usize) -> usize {
+    if visible == 0 {
+        return 0;
+    }
+    let max_top = total.saturating_sub(visible);
+    if total > visible && sel + SCROLLOFF >= top + visible {
+        (sel + SCROLLOFF + 1).saturating_sub(visible).min(max_top)
+    } else if sel < top.saturating_add(SCROLLOFF) {
+        sel.saturating_sub(SCROLLOFF).min(max_top)
+    } else {
+        // Inside the window: keep the offset, but clamp a stale one (the list
+        // can shrink under a filter, and the slice below would panic).
+        top.min(max_top)
+    }
+}
+
 /// `-W` must be a usable panel width (0 would create a zero-width buffer).
 fn valid_width(w: u32) -> bool {
     (1..=MAX_WIDTH).contains(&w)
@@ -538,68 +535,6 @@ impl MenuState {
     }
 }
 
-/// Stdin lines arriving from a reader thread. The event loop already polls
-/// every 16ms, so the queue only needs a mutex — no extra wakeup source.
-struct ItemFeed {
-    queue: Mutex<Vec<items::Item>>,
-    done: AtomicBool,
-}
-
-impl ItemFeed {
-    fn new() -> Arc<Self> {
-        Arc::new(Self {
-            queue: Mutex::new(Vec::new()),
-            done: AtomicBool::new(false),
-        })
-    }
-
-    fn push(&self, batch: Vec<items::Item>) {
-        self.queue.lock().unwrap().extend(batch);
-    }
-
-    fn drain(&self) -> Vec<items::Item> {
-        std::mem::take(&mut *self.queue.lock().unwrap())
-    }
-
-    fn mark_done(&self) {
-        self.done.store(true, Ordering::Release);
-    }
-
-    fn done(&self) -> bool {
-        self.done.load(Ordering::Acquire)
-    }
-
-    /// Read stdin to EOF in a background thread, handing lines over in batches
-    /// so a slow producer never delays the menu appearing.
-    fn spawn() -> Arc<Self> {
-        let feed = Self::new();
-        let reader = Arc::clone(&feed);
-        std::thread::spawn(move || {
-            reader.read_into(io::stdin().lock());
-            reader.mark_done();
-        });
-        feed
-    }
-
-    /// Drain a reader into batches. A line that is not valid UTF-8 is skipped,
-    /// never a reason to stop: truncating the menu at the first bad filename
-    /// would silently hide everything after it.
-    fn read_into(&self, reader: impl BufRead) {
-        const BATCH: usize = 256;
-        let mut batch = Vec::with_capacity(BATCH);
-        for line in reader.lines() {
-            let Ok(line) = line else { continue };
-            batch.push(items::parse(&line));
-            if batch.len() >= BATCH {
-                self.push(std::mem::take(&mut batch));
-            }
-        }
-        if !batch.is_empty() {
-            self.push(batch);
-        }
-    }
-}
-
 #[allow(dead_code)] // state objects kept alive for their proxy bindings
 struct App {
     registry_state: RegistryState,
@@ -779,14 +714,7 @@ impl App {
         // more rows exist beyond it.
         let mut rows: Vec<render::Row> = Vec::with_capacity(visible);
         if visible > 0 {
-            let max_top = total.saturating_sub(visible);
-            if total > visible && self.menu.sel + SCROLLOFF >= self.top + visible {
-                self.top = (self.menu.sel + SCROLLOFF + 1)
-                    .saturating_sub(visible)
-                    .min(max_top);
-            } else if self.menu.sel < self.top.saturating_add(SCROLLOFF) {
-                self.top = self.menu.sel.saturating_sub(SCROLLOFF).min(max_top);
-            }
+            self.top = viewport_top(self.menu.sel, self.top, visible, total);
             let top = self.top;
             for (i, &mi) in self.menu.matches[top..(top + visible).min(total)]
                 .iter()
@@ -1126,37 +1054,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn item_feed_drains_batches_in_order_and_signals_eof() {
-        let feed = ItemFeed::new();
-        feed.push(vec![items::parse("a")]);
-        feed.push(vec![items::parse("b"), items::parse("c")]);
-        let got: Vec<String> = feed.drain().into_iter().map(|i| i.text).collect();
-        assert_eq!(got, vec!["a", "b", "c"]);
-        assert!(feed.drain().is_empty(), "drain empties the queue");
-        assert!(!feed.done());
-        feed.mark_done();
-        assert!(feed.done());
-    }
-
-    #[test]
     fn output_flag_is_parsed() {
         assert_eq!(
             opts(&["-o", "HDMI-A-1"]).output.as_deref(),
             Some("HDMI-A-1")
         );
         assert_eq!(opts(&[]).output, None);
-    }
-
-    #[test]
-    fn item_feed_skips_invalid_utf8_without_truncating() {
-        let feed = ItemFeed::new();
-        feed.read_into(&b"good\n\xff not utf8\nlast\n"[..]);
-        let got: Vec<String> = feed.drain().into_iter().map(|i| i.text).collect();
-        assert_eq!(
-            got,
-            vec!["good", "last"],
-            "a bad line must not end the stream"
-        );
     }
 
     #[test]
@@ -1183,42 +1086,21 @@ mod tests {
     }
 
     #[test]
-    fn animation_eases_to_the_target_and_stops() {
-        let start = Instant::now();
-        let grow = Anim {
-            from: 24,
-            to: 1560,
-            start,
-        };
-        assert_eq!(grow.height(start), (24, true), "starts at the from height");
-        let (mid, running) = grow.height(start + ANIM / 2);
-        assert!(
-            running && mid > 24 && mid < 1560,
-            "mid-flight is between the ends: {mid}"
-        );
-        assert_eq!(
-            grow.height(start + ANIM),
-            (1560, false),
-            "ends exactly at the target"
-        );
-        assert_eq!(
-            grow.height(start + ANIM + Duration::from_millis(50)).0,
-            1560
-        );
-
-        // Collapsing runs the same way, monotonically (no bounce).
-        let shrink = Anim {
-            from: 1560,
-            to: 24,
-            start,
-        };
-        let mut prev = 1560;
-        for ms in 0..=ANIM.as_millis() as u64 {
-            let (h, _) = shrink.height(start + Duration::from_millis(ms));
-            assert!(h <= prev, "collapse must not bounce: {h} > {prev}");
-            prev = h;
-        }
-        assert_eq!(prev, 24, "collapse reaches the bar height");
+    fn viewport_keeps_the_selection_in_view_with_context() {
+        // The whole list fits: never scroll, even with the last row selected.
+        assert_eq!(viewport_top(9, 0, 10, 10), 0);
+        // Scrolling down leaves one row of context below the band.
+        assert_eq!(viewport_top(9, 0, 10, 100), 1);
+        assert_eq!(viewport_top(19, 1, 10, 100), 11);
+        // Scrolling up leaves one row of context above.
+        assert_eq!(viewport_top(10, 20, 10, 100), 9);
+        // Moving inside the window keeps the offset (no jitter).
+        assert_eq!(viewport_top(12, 5, 10, 100), 5);
+        // Collapsed bar and short lists sit at the top.
+        assert_eq!(viewport_top(0, 0, 0, 100), 0);
+        assert_eq!(viewport_top(3, 0, 10, 4), 0);
+        // A shrunken list clamps a stale offset instead of panicking the slice.
+        assert_eq!(viewport_top(0, 50, 10, 3), 0);
     }
 
     fn sample_items() -> Vec<items::Item> {
