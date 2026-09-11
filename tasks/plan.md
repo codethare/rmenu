@@ -133,6 +133,19 @@
 - rustfmt 已重排过代码，多个 oldText 因多行 assert 失效——编辑前先看实际文本
 
 验证检查点：73 passed；clippy 0；fmt clean；`TryExec`/对比度/视口均有独立断言。
+# Plan: idle-wakeups（1/2/5）
+
+1. deadline-sleep（main.rs）：新增 `const FRAME=16ms` 与纯函数 `loop_timeout(busy, next_blink, now)`；循环改为 `let busy = app.streaming() || app.anim.as_ref().is_some_and(|a| a.height(now).1);` 后按需睡眠；`App::streaming()` = 有 feed 且未 done
+2. tty-hint（main.rs）：`use std::io::IsTerminal;`，在 stdin 分支里检测并 `eprintln!` 一行提示（不改行为）
+3. clip-test（render.rs）：直接调 `draw_text` 画 200 个字符到 60px 限宽，断言返回值 ≤ 限宽、界限内有墨迹、界限右侧全为未写（零像素）
+
+风险与取舍：
+
+- 睡眠变长后，首帧流式条目必须仍及时出现 → busy 已含 `streaming()`（否则 500 ms 一次更新，是回归）
+- 已过期的截止时刻必须返回 0，否则闪烁停摆；已加断言
+- `app.anim.map(...)` 会移动出 `App`（编译失败）→ 用 `as_ref().is_some_and(...)`
+
+验证检查点：75 passed；clippy 0；fmt clean；release 构建通过。
 # Plan: prompt-badge-r2
 
 确认范围：不做「固定槽位/坐标一致」（否决）；只做三件：

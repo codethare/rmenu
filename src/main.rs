@@ -13,6 +13,7 @@ mod render;
 use anim::Anim;
 use feed::ItemFeed;
 
+use std::io::IsTerminal;
 use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -65,6 +66,8 @@ const MAX_WIDTH: u32 = 16384;
 const MAX_LINES: usize = 1000;
 /// Caret blink half-period; typing resets it to visible.
 const BLINK_PERIOD: Duration = Duration::from_millis(500);
+/// Frame clock for height transitions and while stdin is still streaming.
+const FRAME: Duration = Duration::from_millis(16);
 struct Opts {
     prompt: String,
     width: u32,
@@ -179,6 +182,11 @@ fn main() {
         }
         (merged, None)
     } else {
+        // Without a pipe (and without `--run`) this would just look hung while
+        // it waits for stdin, so say what is happening. Behavior is unchanged.
+        if std::io::stdin().is_terminal() {
+            eprintln!("rmenu: reading items from the terminal; pipe or redirect stdin");
+        }
         (Vec::new(), Some(ItemFeed::spawn()))
     };
 
@@ -302,8 +310,14 @@ fn main() {
     };
 
     loop {
+        // Sleep only as long as the next deadline allows: streaming items and a
+        // running height transition need the frame clock, otherwise the caret
+        // blink is the only thing left. Wayland input wakes the loop
+        // immediately, so an idle menu goes from ~62 wakeups/s to ~2/s.
+        let now = Instant::now();
+        let busy = app.streaming() || app.anim.as_ref().is_some_and(|a| a.height(now).1);
         if event_loop
-            .dispatch(Duration::from_millis(16), &mut app)
+            .dispatch(loop_timeout(busy, app.next_blink, now), &mut app)
             .is_err()
         {
             break;
@@ -315,6 +329,17 @@ fn main() {
         }
     }
     app.finish();
+}
+
+/// How long the event loop may sleep. `busy` covers the two things that need
+/// the frame clock (a height transition, items still streaming in); otherwise
+/// the caret blink is the only deadline.
+fn loop_timeout(busy: bool, next_blink: Instant, now: Instant) -> Duration {
+    if busy {
+        FRAME
+    } else {
+        next_blink.saturating_duration_since(now)
+    }
 }
 
 /// Top row of the visible window: keeps the selection in view with `SCROLLOFF`
@@ -595,6 +620,11 @@ impl App {
         } else {
             self.menu.matches.len().min(MAX_VISIBLE)
         }
+    }
+
+    /// True while stdin is still feeding items in (`--run` never streams).
+    fn streaming(&self) -> bool {
+        self.feed.as_ref().is_some_and(|f| !f.done())
     }
 
     /// Pull streamed stdin lines into the menu. Called every loop tick and
@@ -1060,6 +1090,23 @@ mod tests {
             Some("HDMI-A-1")
         );
         assert_eq!(opts(&[]).output, None);
+    }
+
+    #[test]
+    fn loop_timeout_sleeps_to_the_next_deadline() {
+        let now = Instant::now();
+        // Streaming or animating: keep the frame clock.
+        assert_eq!(loop_timeout(true, now + BLINK_PERIOD, now), FRAME);
+        // Idle: sleep right up to the next caret blink, not a fixed tick.
+        assert_eq!(
+            loop_timeout(false, now + Duration::from_millis(500), now),
+            Duration::from_millis(500)
+        );
+        // A deadline that already passed must not sleep, or the blink stalls.
+        assert_eq!(
+            loop_timeout(false, now, now + Duration::from_millis(5)),
+            Duration::ZERO
+        );
     }
 
     #[test]

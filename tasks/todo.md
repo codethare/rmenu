@@ -71,3 +71,9 @@
 - [x] 5a 抽出 `anim.rs`、`feed.rs`（`pub(crate)` + 测试随行）
 - [ ] 5b 抽出 `opts.rs`、`menu.rs`（需字段放权 + 拆测试辅助，下一轮）
 - [x] 回归：73 passed；clippy 0；fmt clean
+# Todo: idle-wakeups（1/2/5）
+
+- [x] 1 按需睡眠：空闲唤醒 62.5 → ≤2 次/秒；`loop_timeout` 断言（busy/空闲/过期）
+- [x] 2 stdin 为 tty 时提示（行为与退出码不变）
+- [x] 5 `draw_text` 裁剪边界断言（不越界写）
+- [x] 回归：75 passed；clippy 0；fmt clean

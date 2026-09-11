@@ -951,6 +951,50 @@ mod tests {
         assert!(!solid, "blinked-off caret must not be drawn");
     }
 
+    /// Clipping: text longer than `max_w` stops at the limit and never writes
+    /// past it. This is the boundary a future ellipsis / match highlight builds
+    /// on, and it guards against overflow regressions.
+    #[test]
+    fn draw_text_clips_at_max_width_without_overflow() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (400u32, font.row_h);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let colors = Colors::default();
+        let (start, max_w) = (crate::PAD as f32, 60.0f32);
+        let limit = (start + max_w).ceil() as u32;
+        let long = "W".repeat(200);
+
+        let drawn = draw_text(
+            &mut buf,
+            w,
+            h,
+            &font,
+            start,
+            row_baseline(&font, 0),
+            &long,
+            colors.fg_prompt,
+            max_w,
+            Subpixel::Gray,
+        );
+        assert!(drawn <= start + max_w, "advance {drawn} ran past the limit");
+        let ink = |px: &[u8]| px[..3] != [0, 0, 0];
+        // Something was drawn inside the limit...
+        let inside = (0..h)
+            .flat_map(|y| (0..limit).map(move |x| (x, y)))
+            .any(|(x, y)| ink(&buf[((y * w + x) * 4) as usize..][..4]));
+        assert!(
+            inside,
+            "the clipped text should still draw inside the limit"
+        );
+        // ...and nothing at or past it.
+        for y in 0..h {
+            for x in limit..w {
+                let px = &buf[((y * w + x) * 4) as usize..][..4];
+                assert!(!ink(px), "ink past the clip limit at ({x},{y})");
+            }
+        }
+    }
+
     #[test]
     fn scroll_thumb_only_when_overflowing_and_tracks_position() {
         assert_eq!(
