@@ -47,13 +47,19 @@ pub fn load_apps() -> Vec<App> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut apps = Vec::new();
     for dir in app_dirs() {
-        let Ok(rd) = std::fs::read_dir(&dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
         for entry in rd.flatten() {
             let path = entry.path();
             if path.extension().and_then(|e| e.to_str()) != Some("desktop") {
                 continue;
             }
-            let Some(file) = path.file_name().and_then(|f| f.to_str()).map(str::to_string) else {
+            let Some(file) = path
+                .file_name()
+                .and_then(|f| f.to_str())
+                .map(str::to_string)
+            else {
                 continue;
             };
             if !seen.insert(file) {
@@ -89,7 +95,9 @@ fn parse_desktop(path: &Path) -> Option<App> {
         if !in_entry || line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let Some((key, value)) = line.split_once('=') else { continue };
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
         // `Name[zh_CN]` and friends: the user's locale picks among them.
         if let Some(tag) = key.strip_prefix("Name[").and_then(|k| k.strip_suffix(']')) {
             localized.push((tag.to_string(), value.to_string()));
@@ -123,7 +131,11 @@ fn parse_desktop(path: &Path) -> Option<App> {
     }
     let name = pick_name(&locale_tags(), &localized, name)?;
     let exec = clean_exec(exec.as_deref()?, &name, &path.display().to_string());
-    Some(App { name, exec, keywords })
+    Some(App {
+        name,
+        exec,
+        keywords,
+    })
 }
 
 /// The user's locale tags, most specific first (`zh_CN.UTF-8` -> `zh_CN`, `zh`).
@@ -134,7 +146,10 @@ fn locale_tags() -> Vec<String> {
         .unwrap_or_default();
     let base = raw.split('.').next().unwrap_or("").to_string();
     let lang = base.split('_').next().unwrap_or("").to_string();
-    [base, lang].into_iter().filter(|t| !t.is_empty() && t != "C" && t != "POSIX").collect()
+    [base, lang]
+        .into_iter()
+        .filter(|t| !t.is_empty() && t != "C" && t != "POSIX")
+        .collect()
 }
 
 /// Pick the localized `Name[locale]` for the user's locale, else the plain name.
@@ -159,8 +174,10 @@ fn shown_on(only: Option<&str>, not: Option<&str>, current: &str) -> bool {
     if current.is_empty() {
         return true;
     }
-    let lists =
-        |list: &str| list.split(';').any(|d| !d.is_empty() && current.iter().any(|c| c.eq_ignore_ascii_case(d)));
+    let lists = |list: &str| {
+        list.split(';')
+            .any(|d| !d.is_empty() && current.iter().any(|c| c.eq_ignore_ascii_case(d)))
+    };
     if let Some(l) = only
         && !lists(l)
     {
@@ -212,7 +229,9 @@ fn path_commands_in(path: &str) -> Vec<String> {
     let mut seen: HashSet<String> = HashSet::new();
     let mut out = Vec::new();
     for dir in path.split(':').filter(|d| !d.is_empty()) {
-        let Ok(rd) = std::fs::read_dir(dir) else { continue };
+        let Ok(rd) = std::fs::read_dir(dir) else {
+            continue;
+        };
         for e in rd.flatten() {
             let name = e.file_name().to_string_lossy().into_owned();
             if name.starts_with('.') || seen.contains(&name) {
@@ -222,7 +241,9 @@ fn path_commands_in(path: &str) -> Vec<String> {
             // usually symlinks, e.g. /usr/bin/sh -> bash) but require a regular
             // executable file; checked before `seen` so a later PATH dir can
             // still supply a runnable entry of the same name.
-            let Ok(meta) = std::fs::metadata(e.path()) else { continue };
+            let Ok(meta) = std::fs::metadata(e.path()) else {
+                continue;
+            };
             if !meta.is_file() || meta.permissions().mode() & 0o111 == 0 {
                 continue;
             }
@@ -267,10 +288,22 @@ mod tests {
     #[test]
     fn merge_apps_and_commands_dedups_by_name() {
         let apps = vec![
-            App { name: "Firefox".into(), exec: "firefox %u".into(), keywords: "browser".into() },
-            App { name: "Zathura".into(), exec: "zathura %f".into(), keywords: String::new() },
+            App {
+                name: "Firefox".into(),
+                exec: "firefox %u".into(),
+                keywords: "browser".into(),
+            },
+            App {
+                name: "Zathura".into(),
+                exec: "zathura %f".into(),
+                keywords: String::new(),
+            },
         ];
-        let cmds = vec!["firefox".to_string(), "alacritty".to_string(), "zathura".to_string()];
+        let cmds = vec![
+            "firefox".to_string(),
+            "alacritty".to_string(),
+            "zathura".to_string(),
+        ];
         let items = merged(apps, cmds);
         let names: Vec<&str> = items.iter().map(|i| i.text.as_str()).collect();
         // deduped, sorted, desktop entry wins over the bare command
@@ -280,7 +313,10 @@ mod tests {
     #[test]
     fn path_commands_finds_shell_utilities() {
         let cmds = path_commands();
-        assert!(cmds.iter().any(|c| c == "sh"), "PATH should contain sh: {cmds:?}");
+        assert!(
+            cmds.iter().any(|c| c == "sh"),
+            "PATH should contain sh: {cmds:?}"
+        );
         assert!(cmds.iter().any(|c| c == "ls" || c == "env" || c == "cat"));
     }
 
@@ -296,7 +332,11 @@ mod tests {
         std::fs::create_dir(dir.join("subdir")).unwrap();
 
         let got = path_commands_in(&dir.display().to_string());
-        assert_eq!(got, vec!["runnable"], "only regular executable files are listed");
+        assert_eq!(
+            got,
+            vec!["runnable"],
+            "only regular executable files are listed"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
@@ -310,15 +350,27 @@ mod legacy_tests {
         let name = "App";
         let file = "/apps/app.desktop";
         assert_eq!(clean_exec("firefox %u", name, file), "firefox");
-        assert_eq!(clean_exec("alacritty -e fish %F", name, file), "alacritty -e fish");
-        assert_eq!(clean_exec("code --new-window %F %U", name, file), "code --new-window");
-        assert_eq!(clean_exec("env FOO=1 app --flag", name, file), "env FOO=1 app --flag");
+        assert_eq!(
+            clean_exec("alacritty -e fish %F", name, file),
+            "alacritty -e fish"
+        );
+        assert_eq!(
+            clean_exec("code --new-window %F %U", name, file),
+            "code --new-window"
+        );
+        assert_eq!(
+            clean_exec("env FOO=1 app --flag", name, file),
+            "env FOO=1 app --flag"
+        );
         // Field codes in the middle of the line (and attached to a word) must go
         // too: leaving them makes the launch fail with a literal `%u`.
         assert_eq!(clean_exec("app %u --flag", name, file), "app --flag");
         assert_eq!(clean_exec("--open=app%u", name, file), "--open=app");
         assert_eq!(clean_exec("app --name=%c", name, file), "app --name=App");
-        assert_eq!(clean_exec("app --file=%k", name, file), "app --file=/apps/app.desktop");
+        assert_eq!(
+            clean_exec("app --file=%k", name, file),
+            "app --file=/apps/app.desktop"
+        );
         // `%%` is a literal percent, not a field code.
         assert_eq!(clean_exec("app 100%%", name, file), "app 100%");
     }
@@ -330,22 +382,37 @@ mod legacy_tests {
             ("de".to_string(), "Feuerfuchs".to_string()),
         ];
         let zh = vec!["zh_CN".to_string(), "zh".to_string()];
-        assert_eq!(pick_name(&zh, &names, Some("Firefox".into())), Some("火狐".into()));
+        assert_eq!(
+            pick_name(&zh, &names, Some("Firefox".into())),
+            Some("火狐".into())
+        );
         // An unknown language falls back to the plain name.
         let fr = vec!["fr".to_string()];
-        assert_eq!(pick_name(&fr, &names, Some("Firefox".into())), Some("Firefox".into()));
+        assert_eq!(
+            pick_name(&fr, &names, Some("Firefox".into())),
+            Some("Firefox".into())
+        );
         assert_eq!(pick_name(&zh, &[], None), None);
     }
 
     #[test]
     fn desktop_visibility_filters_by_current_desktop() {
-        assert!(!shown_on(Some("GNOME;"), None, "sway:wlroots"), "other-DE entry is hidden");
+        assert!(
+            !shown_on(Some("GNOME;"), None, "sway:wlroots"),
+            "other-DE entry is hidden"
+        );
         assert!(shown_on(Some("sway;"), None, "sway:wlroots"));
         assert!(shown_on(Some("wlroots;"), None, "sway:wlroots"));
-        assert!(!shown_on(None, Some("sway;"), "sway:wlroots"), "NotShowIn wins");
+        assert!(
+            !shown_on(None, Some("sway;"), "sway:wlroots"),
+            "NotShowIn wins"
+        );
         assert!(shown_on(None, Some("GNOME;"), "sway:wlroots"));
         assert!(shown_on(None, None, "sway"));
-        assert!(shown_on(Some("GNOME;"), Some("sway;"), ""), "no current desktop: no filtering");
+        assert!(
+            shown_on(Some("GNOME;"), Some("sway;"), ""),
+            "no current desktop: no filtering"
+        );
     }
 
     #[test]
@@ -363,7 +430,11 @@ mod legacy_tests {
         assert_eq!(app.name, "Test 应用");
         assert_eq!(app.exec, "test-app --flag");
 
-        std::fs::write(&df, "[Desktop Entry]\nType=Application\nName=Hide Me\nNoDisplay=true\n").unwrap();
+        std::fs::write(
+            &df,
+            "[Desktop Entry]\nType=Application\nName=Hide Me\nNoDisplay=true\n",
+        )
+        .unwrap();
         assert!(parse_desktop(&df).is_none());
 
         // Terminal apps and entries for another desktop are not listed.
@@ -372,21 +443,33 @@ mod legacy_tests {
             "[Desktop Entry]\nName=Needs TTY\nExec=htop\nTerminal=true\n",
         )
         .unwrap();
-        assert!(parse_desktop(&df).is_none(), "Terminal=true is a dead entry here");
+        assert!(
+            parse_desktop(&df).is_none(),
+            "Terminal=true is a dead entry here"
+        );
         std::fs::write(
             &df,
             "[Desktop Entry]\nName=GNOME Only\nExec=gnome-thing\nOnlyShowIn=GNOME;\n",
         )
         .unwrap();
         let current = std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default();
-        assert_eq!(parse_desktop(&df).is_some(), shown_on(Some("GNOME;"), None, &current));
+        assert_eq!(
+            parse_desktop(&df).is_some(),
+            shown_on(Some("GNOME;"), None, &current)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
     fn scans_system_dirs() {
         let apps = load_apps();
-        assert!(!apps.is_empty(), "system /usr/share/applications should yield entries");
-        assert!(apps.windows(2).all(|w| w[0].name.to_lowercase() <= w[1].name.to_lowercase()));
+        assert!(
+            !apps.is_empty(),
+            "system /usr/share/applications should yield entries"
+        );
+        assert!(
+            apps.windows(2)
+                .all(|w| w[0].name.to_lowercase() <= w[1].name.to_lowercase())
+        );
     }
 }

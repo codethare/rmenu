@@ -40,12 +40,19 @@ pub fn filter(items: &[Item], query: &str, ci: bool) -> Vec<usize> {
     if query.is_empty() {
         return (0..items.len()).collect();
     }
-    let query = if ci { query.to_lowercase() } else { query.to_string() };
+    let query = if ci {
+        query.to_lowercase()
+    } else {
+        query.to_string()
+    };
     let toks: Vec<&str> = query.split_whitespace().collect();
     // Keywords are matched case-insensitively in both modes: they are never
     // displayed, so the user cannot see which case they were written in.
-    let ktoks: Vec<String> =
-        if ci { Vec::new() } else { toks.iter().map(|t| t.to_lowercase()).collect() };
+    let ktoks: Vec<String> = if ci {
+        Vec::new()
+    } else {
+        toks.iter().map(|t| t.to_lowercase()).collect()
+    };
     let mut exact = Vec::new();
     let mut prefix = Vec::new();
     let mut sub = Vec::new();
@@ -53,8 +60,7 @@ pub fn filter(items: &[Item], query: &str, ci: bool) -> Vec<usize> {
         let hay = if ci { &it.lc } else { &it.text };
         let all = toks.iter().enumerate().all(|(n, t)| {
             contains(hay, t)
-                || (!it.extra.is_empty()
-                    && contains(&it.extra, if ci { t } else { &ktoks[n] }))
+                || (!it.extra.is_empty() && contains(&it.extra, if ci { t } else { &ktoks[n] }))
         });
         if !all {
             continue;
@@ -87,12 +93,21 @@ mod tests {
 
     #[test]
     fn filter_rank_exact_prefix_substr() {
-        let it = items(&["libre/server", "libre", "LIBREoffice", "libreoffice", "not-libre"]);
+        let it = items(&[
+            "libre/server",
+            "libre",
+            "LIBREoffice",
+            "libreoffice",
+            "not-libre",
+        ]);
         let m = filter(&it, "libre", false);
         let got: Vec<&str> = m.iter().map(|&i| it[i].text.as_str()).collect();
         // exact prefix first (in original order), then substring matches; "LIBREoffice"
         // is case-mismatched so it is not a substring match here.
-        assert_eq!(got, vec!["libre/server", "libre", "libreoffice", "not-libre"]);
+        assert_eq!(
+            got,
+            vec!["libre/server", "libre", "libreoffice", "not-libre"]
+        );
     }
 
     #[test]

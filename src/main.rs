@@ -26,22 +26,22 @@ use smithay_client_toolkit::{
     registry::{ProvidesRegistryState, RegistryState},
     registry_handlers,
     seat::{
-        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
         Capability, SeatHandler, SeatState,
+        keyboard::{KeyEvent, KeyboardHandler, Keysym, Modifiers, RawModifiers},
     },
     shell::{
+        WaylandSurface,
         wlr_layer::{
             Anchor, KeyboardInteractivity, Layer, LayerShell, LayerShellHandler, LayerSurface,
             LayerSurfaceConfigure,
         },
-        WaylandSurface,
     },
-    shm::{slot::SlotPool, Shm, ShmHandler},
+    shm::{Shm, ShmHandler, slot::SlotPool},
 };
 use wayland_client::{
+    Connection, QueueHandle,
     globals::registry_queue_init,
     protocol::{wl_keyboard, wl_output, wl_seat, wl_shm, wl_surface},
-    Connection, QueueHandle,
 };
 
 const DEFAULT_WIDTH: u32 = 640;
@@ -49,7 +49,8 @@ const FONT_SIZE: f32 = 16.0;
 /// Text antialiasing: LCD subpixel (`Rgb`) is noticeably sharper on 1× displays.
 /// Switch to `Bgr` for BGR-stripe panels (text would fringe on the wrong side)
 /// or `Gray` for neutral rendering without colour fringing.
-const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;/// Panel content inset: must be >= corner radius so text never grazes the curve.
+const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;
+/// Panel content inset: must be >= corner radius so text never grazes the curve.
 const PAD: u32 = 12;
 /// Away-from-edge float for the upper-center panel (bottom mode keeps 8px).
 const TOP_MARGIN: i32 = 32;
@@ -138,14 +139,22 @@ fn parse_opts_from(args: impl Iterator<Item = String>) -> Opts {
             "-P" => o.password = true,
             "-p" => o.prompt = args.next().unwrap_or_else(|| usage()),
             "-l" => {
-                let n: usize = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage());
+                let n: usize = args
+                    .next()
+                    .unwrap_or_else(|| usage())
+                    .parse()
+                    .unwrap_or_else(|_| usage());
                 if !valid_lines(n) {
                     usage();
                 }
                 o.lines = n;
             }
             "-W" => {
-                let n: u32 = args.next().unwrap_or_else(|| usage()).parse().unwrap_or_else(|_| usage());
+                let n: u32 = args
+                    .next()
+                    .unwrap_or_else(|| usage())
+                    .parse()
+                    .unwrap_or_else(|_| usage());
                 if !valid_width(n) {
                     usage();
                 }
@@ -196,8 +205,10 @@ fn main() {
         (Vec::new(), Some(ItemFeed::spawn()))
     };
 
-    let font = font::MenuFont::load(opts.font.as_deref(), FONT_SIZE)
-        .unwrap_or_else(|e| { eprintln!("rmenu: {e}"); exit(1) });
+    let font = font::MenuFont::load(opts.font.as_deref(), FONT_SIZE).unwrap_or_else(|e| {
+        eprintln!("rmenu: {e}");
+        exit(1)
+    });
 
     let conn = Connection::connect_to_env().unwrap_or_else(|e| {
         eprintln!("rmenu: cannot connect to Wayland: {e}");
@@ -215,10 +226,12 @@ fn main() {
         exit(1);
     });
     let loop_handle = event_loop.handle();
-    WaylandSource::new(conn.clone(), event_queue).insert(loop_handle.clone()).unwrap_or_else(|e| {
-        eprintln!("rmenu: {e}");
-        exit(1);
-    });
+    WaylandSource::new(conn.clone(), event_queue)
+        .insert(loop_handle.clone())
+        .unwrap_or_else(|e| {
+            eprintln!("rmenu: {e}");
+            exit(1);
+        });
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
@@ -247,9 +260,18 @@ fn main() {
     };
     let height = font.row_h * (row_capacity(opts.lines) as u32 + 1);
     let surface = compositor.create_surface(&qh);
-    let layer =
-        layer_shell.create_layer_surface(&qh, surface, Layer::Overlay, Some("rmenu"), target.as_ref());
-    layer.set_anchor(if opts.bottom { Anchor::BOTTOM } else { Anchor::TOP });
+    let layer = layer_shell.create_layer_surface(
+        &qh,
+        surface,
+        Layer::Overlay,
+        Some("rmenu"),
+        target.as_ref(),
+    );
+    layer.set_anchor(if opts.bottom {
+        Anchor::BOTTOM
+    } else {
+        Anchor::TOP
+    });
     layer.set_margin(if opts.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     // Start collapsed to the single input bar (Spotlight); the list appears
@@ -303,7 +325,10 @@ fn main() {
     };
 
     loop {
-        if event_loop.dispatch(Duration::from_millis(16), &mut app).is_err() {
+        if event_loop
+            .dispatch(Duration::from_millis(16), &mut app)
+            .is_err()
+        {
             break;
         }
         app.sync_items();
@@ -328,7 +353,11 @@ fn valid_lines(n: usize) -> bool {
 /// Subpixel AA pays off on 1× outputs; on HiDPI the pixel grid is already dense,
 /// so it only adds colour fringing and ~55% more paint time there.
 fn text_aa(scale: u32) -> render::Subpixel {
-    if scale > 1 { render::Subpixel::Gray } else { TEXT_AA }
+    if scale > 1 {
+        render::Subpixel::Gray
+    } else {
+        TEXT_AA
+    }
 }
 
 /// Row capacity for the shm pool: stdin streams in, so size for the cap up
@@ -518,7 +547,10 @@ struct ItemFeed {
 
 impl ItemFeed {
     fn new() -> Arc<Self> {
-        Arc::new(Self { queue: Mutex::new(Vec::new()), done: AtomicBool::new(false) })
+        Arc::new(Self {
+            queue: Mutex::new(Vec::new()),
+            done: AtomicBool::new(false),
+        })
     }
 
     fn push(&self, batch: Vec<items::Item>) {
@@ -633,7 +665,9 @@ impl App {
     /// Pull streamed stdin lines into the menu. Called every loop tick and
     /// before a key is handled, so typing always filters the freshest list.
     fn sync_items(&mut self) {
-        let Some(feed) = self.feed.clone() else { return };
+        let Some(feed) = self.feed.clone() else {
+            return;
+        };
         let fresh = feed.drain();
         if !fresh.is_empty() {
             let sel = self.menu.sel;
@@ -658,7 +692,8 @@ impl App {
             return;
         }
         self.scale = scale;
-        if let Ok(font) = font::MenuFont::load(self.font_spec.as_deref(), FONT_SIZE * scale as f32) {
+        if let Ok(font) = font::MenuFont::load(self.font_spec.as_deref(), FONT_SIZE * scale as f32)
+        {
             self.font = font;
         }
         self.request_draw();
@@ -691,7 +726,8 @@ impl App {
         self.sync_items();
         self.wake_caret();
         let visible = self.visible();
-        self.menu.on_key(keysym, utf8, self.mods, &self.items, self.ci, visible);
+        self.menu
+            .on_key(keysym, utf8, self.mods, &self.items, self.ci, visible);
         // Ctrl-Return multi-select: emit each pick while the menu keeps running.
         let picked = std::mem::take(&mut self.menu.picked);
         for v in picked {
@@ -725,11 +761,17 @@ impl App {
         if self.frame_pending {
             return;
         }
-        let Some(layer) = self.layer.clone() else { return };
+        let Some(layer) = self.layer.clone() else {
+            return;
+        };
 
         // Spotlight: no list until the query has content; collapse back to the
         // single input bar when the query is cleared.
-        let visible = if self.menu.query.is_empty() { 0 } else { self.visible() };
+        let visible = if self.menu.query.is_empty() {
+            0
+        } else {
+            self.visible()
+        };
         let total = self.menu.matches.len();
 
         // Keep the selection in view with one row of context on each side
@@ -739,14 +781,22 @@ impl App {
         if visible > 0 {
             let max_top = total.saturating_sub(visible);
             if total > visible && self.menu.sel + SCROLLOFF >= self.top + visible {
-                self.top = (self.menu.sel + SCROLLOFF + 1).saturating_sub(visible).min(max_top);
+                self.top = (self.menu.sel + SCROLLOFF + 1)
+                    .saturating_sub(visible)
+                    .min(max_top);
             } else if self.menu.sel < self.top.saturating_add(SCROLLOFF) {
                 self.top = self.menu.sel.saturating_sub(SCROLLOFF).min(max_top);
             }
             let top = self.top;
-            for (i, &mi) in self.menu.matches[top..(top + visible).min(total)].iter().enumerate() {
+            for (i, &mi) in self.menu.matches[top..(top + visible).min(total)]
+                .iter()
+                .enumerate()
+            {
                 let it = &self.items[mi];
-                rows.push(render::Row { text: &it.text, selected: top + i == self.menu.sel });
+                rows.push(render::Row {
+                    text: &it.text,
+                    selected: top + i == self.menu.sel,
+                });
             }
         }
 
@@ -760,10 +810,17 @@ impl App {
         // bar. Each new target restarts the ease from what is on screen now.
         let now = Instant::now();
         if self.target_h != Some(target) {
-            self.anim = Some(Anim { from: self.shown_h, to: target, start: now });
+            self.anim = Some(Anim {
+                from: self.shown_h,
+                to: target,
+                start: now,
+            });
             self.target_h = Some(target);
         }
-        let (h, running) = self.anim.as_ref().map_or((target, false), |a| a.height(now));
+        let (h, running) = self
+            .anim
+            .as_ref()
+            .map_or((target, false), |a| a.height(now));
         if !running {
             self.anim = None;
         }
@@ -772,17 +829,22 @@ impl App {
             layer.set_margin(8, 0, 0, 0);
         } else {
             // Upper-center: 24px top breathing room, horizontally centered.
-            let left = self.output_w.map(|ow| ((ow as i64 - w as i64) / 2).max(0) as i32).unwrap_or(0);
+            let left = self
+                .output_w
+                .map(|ow| ((ow as i64 - w as i64) / 2).max(0) as i32)
+                .unwrap_or(0);
             layer.set_margin(TOP_MARGIN, 0, 0, left);
         }
         layer.set_size(w, h.div_ceil(scale));
         let _ = layer.set_buffer_scale(scale);
 
         let bw = w * scale;
-        let (buffer, canvas) = match self
-            .pool
-            .create_buffer(bw as i32, h as i32, (bw * 4) as i32, wl_shm::Format::Argb8888)
-        {
+        let (buffer, canvas) = match self.pool.create_buffer(
+            bw as i32,
+            h as i32,
+            (bw * 4) as i32,
+            wl_shm::Format::Argb8888,
+        ) {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("rmenu: buffer error: {e}");
@@ -790,10 +852,30 @@ impl App {
                 return;
             }
         };
-        render::draw(canvas, bw, h, &self.font, &self.prompt, &self.menu.query, self.password, &rows, PAD, &self.colors, scale, self.blink, text_aa(scale));
+        render::draw(
+            canvas,
+            bw,
+            h,
+            &self.font,
+            &self.prompt,
+            &self.menu.query,
+            self.password,
+            &rows,
+            PAD,
+            &self.colors,
+            scale,
+            self.blink,
+            text_aa(scale),
+        );
 
         // Scroll position indicator: only while the list overflows the viewport.
-        if let Some((ty, th)) = render::scroll_thumb(self.font.row_h, h.saturating_sub(self.font.row_h), visible, total, self.top) {
+        if let Some((ty, th)) = render::scroll_thumb(
+            self.font.row_h,
+            h.saturating_sub(self.font.row_h),
+            visible,
+            total,
+            self.top,
+        ) {
             let pad = PAD * scale;
             let tw = 3 * scale;
             let tx = bw - pad + pad.saturating_sub(tw) / 2;
@@ -849,13 +931,7 @@ impl CompositorHandler for App {
         _: wl_output::Transform,
     ) {
     }
-    fn frame(
-        &mut self,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-        _: &wl_surface::WlSurface,
-        _: u32,
-    ) {
+    fn frame(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: u32) {
         self.frame_pending = false;
         if self.dirty {
             self.draw();
@@ -868,7 +944,9 @@ impl CompositorHandler for App {
         _: &wl_surface::WlSurface,
         output: &wl_output::WlOutput,
     ) {
-        let Some(info) = self.output_state.info(output) else { return };
+        let Some(info) = self.output_state.info(output) else {
+            return;
+        };
         if let Some((w, _)) = info.logical_size
             && self.output_w != Some(w.max(0) as u32)
         {
@@ -878,7 +956,14 @@ impl CompositorHandler for App {
         }
         self.apply_scale(info.scale_factor);
     }
-    fn surface_leave(&mut self, _: &Connection, _: &QueueHandle<Self>, _: &wl_surface::WlSurface, _: &wl_output::WlOutput) {}
+    fn surface_leave(
+        &mut self,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+        _: &wl_surface::WlSurface,
+        _: &wl_output::WlOutput,
+    ) {
+    }
 }
 
 impl LayerShellHandler for App {
@@ -1055,7 +1140,10 @@ mod tests {
 
     #[test]
     fn output_flag_is_parsed() {
-        assert_eq!(opts(&["-o", "HDMI-A-1"]).output.as_deref(), Some("HDMI-A-1"));
+        assert_eq!(
+            opts(&["-o", "HDMI-A-1"]).output.as_deref(),
+            Some("HDMI-A-1")
+        );
         assert_eq!(opts(&[]).output, None);
     }
 
@@ -1064,13 +1152,25 @@ mod tests {
         let feed = ItemFeed::new();
         feed.read_into(&b"good\n\xff not utf8\nlast\n"[..]);
         let got: Vec<String> = feed.drain().into_iter().map(|i| i.text).collect();
-        assert_eq!(got, vec!["good", "last"], "a bad line must not end the stream");
+        assert_eq!(
+            got,
+            vec!["good", "last"],
+            "a bad line must not end the stream"
+        );
     }
 
     #[test]
     fn subpixel_aa_is_only_used_at_scale_one() {
-        assert_eq!(text_aa(1), render::Subpixel::Rgb, "1× displays get the sharper mode");
-        assert_eq!(text_aa(2), render::Subpixel::Gray, "HiDPI does not need it (and pays for it)");
+        assert_eq!(
+            text_aa(1),
+            render::Subpixel::Rgb,
+            "1× displays get the sharper mode"
+        );
+        assert_eq!(
+            text_aa(2),
+            render::Subpixel::Gray,
+            "HiDPI does not need it (and pays for it)"
+        );
     }
 
     #[test]
@@ -1085,15 +1185,33 @@ mod tests {
     #[test]
     fn animation_eases_to_the_target_and_stops() {
         let start = Instant::now();
-        let grow = Anim { from: 24, to: 1560, start };
+        let grow = Anim {
+            from: 24,
+            to: 1560,
+            start,
+        };
         assert_eq!(grow.height(start), (24, true), "starts at the from height");
         let (mid, running) = grow.height(start + ANIM / 2);
-        assert!(running && mid > 24 && mid < 1560, "mid-flight is between the ends: {mid}");
-        assert_eq!(grow.height(start + ANIM), (1560, false), "ends exactly at the target");
-        assert_eq!(grow.height(start + ANIM + Duration::from_millis(50)).0, 1560);
+        assert!(
+            running && mid > 24 && mid < 1560,
+            "mid-flight is between the ends: {mid}"
+        );
+        assert_eq!(
+            grow.height(start + ANIM),
+            (1560, false),
+            "ends exactly at the target"
+        );
+        assert_eq!(
+            grow.height(start + ANIM + Duration::from_millis(50)).0,
+            1560
+        );
 
         // Collapsing runs the same way, monotonically (no bounce).
-        let shrink = Anim { from: 1560, to: 24, start };
+        let shrink = Anim {
+            from: 1560,
+            to: 24,
+            start,
+        };
         let mut prev = 1560;
         for ms in 0..=ANIM.as_millis() as u64 {
             let (h, _) = shrink.height(start + Duration::from_millis(ms));
@@ -1120,12 +1238,23 @@ mod tests {
     }
 
     fn mods(ctrl: bool, shift: bool) -> Modifiers {
-        Modifiers { ctrl, shift, ..Default::default() }
+        Modifiers {
+            ctrl,
+            shift,
+            ..Default::default()
+        }
     }
 
     /// Key press with default modifiers; `visible=3` mirrors the 3-item sample list.
     fn key(m: &mut MenuState, items: &[items::Item], ks: Keysym, u: Option<&str>) {
-        m.on_key(ks, u.map(String::from), Modifiers::default(), items, false, 3);
+        m.on_key(
+            ks,
+            u.map(String::from),
+            Modifiers::default(),
+            items,
+            false,
+            3,
+        );
     }
 
     /// xkeysym for any printable 'F' key; the `_` arm only uses the utf8 text.
@@ -1136,7 +1265,10 @@ mod tests {
     #[test]
     fn color_flags_match_wmenu_fields() {
         // `-M`/`-m` are the prompt rows, `-S`/`-s` the selection (wmenu semantics).
-        let o = opts(&["-N", "112233", "-n", "445566", "-M", "778899", "-m", "aabbcc", "-S", "ddeeff", "-s", "010203"]);
+        let o = opts(&[
+            "-N", "112233", "-n", "445566", "-M", "778899", "-m", "aabbcc", "-S", "ddeeff", "-s",
+            "010203",
+        ]);
         assert_eq!(o.colors.bg_normal, [0x33, 0x22, 0x11, 0xff]);
         assert_eq!(o.colors.fg_normal, [0x66, 0x55, 0x44, 0xff]);
         assert_eq!(o.colors.bg_prompt, [0x99, 0x88, 0x77, 0xff]);
@@ -1208,8 +1340,22 @@ mod tests {
         // unbound chords (C-a, C-v) must still never become query text.
         let items = sample_items();
         let mut m = MenuState::new(items.len());
-        m.on_key(Keysym::from(0x61u32), Some("\u{1}".into()), mods(true, false), &items, false, 3);
-        m.on_key(Keysym::from(0x76u32), Some("\u{16}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x61u32),
+            Some("\u{1}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
+        m.on_key(
+            Keysym::from(0x76u32),
+            Some("\u{16}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.query, "");
         assert_eq!(m.matches.len(), 3);
     }
@@ -1245,14 +1391,49 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'i'); // all three matches
-        m.on_key(Keysym::from(0x70u32), Some("\u{10}".into()), mods(true, false), &items, false, 3); // C-p clamp at top
+        m.on_key(
+            Keysym::from(0x70u32),
+            Some("\u{10}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        ); // C-p clamp at top
         assert_eq!(m.sel, 0);
-        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3); // C-n
+        m.on_key(
+            Keysym::from(0x6eu32),
+            Some("\u{e}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        ); // C-n
         assert_eq!(m.sel, 1);
-        m.on_key(Keysym::from(0x70u32), Some("\u{10}".into()), mods(true, false), &items, false, 3); // C-p
+        m.on_key(
+            Keysym::from(0x70u32),
+            Some("\u{10}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        ); // C-p
         assert_eq!(m.sel, 0);
-        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3);
-        m.on_key(Keysym::from(0x6eu32), Some("\u{e}".into()), mods(true, false), &items, false, 3); // C-n clamp at bottom
+        m.on_key(
+            Keysym::from(0x6eu32),
+            Some("\u{e}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
+        m.on_key(
+            Keysym::from(0x6eu32),
+            Some("\u{e}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        ); // C-n clamp at bottom
         assert_eq!(m.sel, 2);
     }
 
@@ -1260,7 +1441,14 @@ mod tests {
     fn page_keys_jump_by_visible_rows() {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
-        m.on_key(Keysym::Page_Down, None, mods(false, false), &items, false, 2);
+        m.on_key(
+            Keysym::Page_Down,
+            None,
+            mods(false, false),
+            &items,
+            false,
+            2,
+        );
         assert_eq!(m.sel, 2); // clamped to last (3 items, page 2)
         m.on_key(Keysym::Page_Up, None, mods(false, false), &items, false, 2);
         assert_eq!(m.sel, 0);
@@ -1286,7 +1474,14 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'a');
-        m.on_key(Keysym::from(0x63u32), Some("\u{3}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x63u32),
+            Some("\u{3}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.done, Some(Done::Cancel));
     }
 
@@ -1295,7 +1490,14 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'f');
-        m.on_key(Keysym::from(0x75u32), Some("\u{15}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x75u32),
+            Some("\u{15}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.query, "");
         assert_eq!(m.matches.len(), 3);
     }
@@ -1307,7 +1509,14 @@ mod tests {
         for c in ['a', 'b', ' ', 'c', 'd'] {
             type_key(&mut m, &items, c); // "ab cd"
         }
-        m.on_key(Keysym::from(0x77u32), Some("\u{17}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x77u32),
+            Some("\u{17}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.query, "ab");
     }
 
@@ -1318,7 +1527,14 @@ mod tests {
         for c in ['a', 'b', ' ', 'c', 'd', ' '] {
             type_key(&mut m, &items, c); // "ab cd "
         }
-        m.on_key(Keysym::from(0x77u32), Some("\u{17}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x77u32),
+            Some("\u{17}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.query, "ab");
     }
 
@@ -1327,7 +1543,14 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'l');
-        m.on_key(Keysym::from(0x68u32), Some("\u{8}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x68u32),
+            Some("\u{8}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.query, "");
         assert_eq!(m.matches.len(), 3);
     }
@@ -1337,7 +1560,14 @@ mod tests {
         let items = sample_items();
         let mut m = MenuState::new(items.len());
         type_key(&mut m, &items, 'l'); // libreoffice
-        m.on_key(Keysym::from(0x6au32), Some("\u{a}".into()), mods(true, false), &items, false, 3);
+        m.on_key(
+            Keysym::from(0x6au32),
+            Some("\u{a}".into()),
+            mods(true, false),
+            &items,
+            false,
+            3,
+        );
         assert_eq!(m.done, Some(Done::Select("libreoffice".into())));
     }
 
@@ -1365,7 +1595,14 @@ mod tests {
         assert_eq!(m.sel, 2);
         m.on_key(Keysym::Return, None, ctrl, &items, false, 3);
         assert_eq!(m.sel, 2); // clamps at last
-        assert_eq!(m.picked, vec!["firefox".to_string(), "alacritty".to_string(), "libreoffice".to_string()]);
+        assert_eq!(
+            m.picked,
+            vec![
+                "firefox".to_string(),
+                "alacritty".to_string(),
+                "libreoffice".to_string()
+            ]
+        );
     }
 
     #[test]

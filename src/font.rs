@@ -1,12 +1,12 @@
 //! Font loading: an explicit font path, or an auto-picked system font
 //! (CJK-capable preferred so Chinese labels render).
 
+#[cfg(test)]
+use ab_glyph::GlyphId;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use ab_glyph::GlyphId;
 
 /// One coverage plane of a rasterized glyph: 8-bit coverage plus where it sits
 /// relative to the canonical pen position (the pen with only its subpixel part
@@ -67,10 +67,12 @@ impl MenuFont {
         let (bytes, index, size) = match spec {
             Some(s) => resolve_family(s, size)?,
             None => {
-                let (path, index) =
-                    chain.first().cloned().ok_or("no usable system font found".to_string())?;
-                let bytes =
-                    std::fs::read(&path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
+                let (path, index) = chain
+                    .first()
+                    .cloned()
+                    .ok_or("no usable system font found".to_string())?;
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| format!("cannot read {}: {e}", path.display()))?;
                 (bytes, index, size)
             }
         };
@@ -180,8 +182,11 @@ fn query_family(family: &str, weight: fontdb::Weight) -> Option<(Vec<u8>, u32)> 
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let fam = fontdb::Family::Name(family);
-    let q =
-        |w| fontdb::Query { families: std::slice::from_ref(&fam), weight: w, ..Default::default() };
+    let q = |w| fontdb::Query {
+        families: std::slice::from_ref(&fam),
+        weight: w,
+        ..Default::default()
+    };
     db.query(&q(weight))
         .or_else(|| db.query(&q(fontdb::Weight::NORMAL)))
         .and_then(|id| copy_face(&db, id))
@@ -219,7 +224,10 @@ fn system_chain() -> Vec<(PathBuf, u32)> {
     // and CJK faces never carry -style glyphs, so a face whose family mentions
     // "Nerd Font" joins the chain to resolve them.
     for face in db.faces() {
-        if face.families.iter().any(|f| f.0.to_ascii_lowercase().contains("nerd font"))
+        if face
+            .families
+            .iter()
+            .any(|f| f.0.to_ascii_lowercase().contains("nerd font"))
             && let Some(found) = face_path(&db, face.id)
         {
             out.push(found);
@@ -238,7 +246,10 @@ fn system_chain() -> Vec<(PathBuf, u32)> {
 }
 
 fn query_path(db: &fontdb::Database, family: &str) -> Option<(PathBuf, u32)> {
-    let id = db.query(&fontdb::Query { families: &[fontdb::Family::Name(family)], ..Default::default() })?;
+    let id = db.query(&fontdb::Query {
+        families: &[fontdb::Family::Name(family)],
+        ..Default::default()
+    })?;
     face_path(db, id)
 }
 
@@ -289,11 +300,7 @@ fn cache_key() -> Option<Vec<(PathBuf, std::time::SystemTime)>> {
         .into_iter()
         .filter_map(|d| Some((d.clone(), std::fs::metadata(&d).ok()?.modified().ok()?)))
         .collect();
-    if key.is_empty() {
-        None
-    } else {
-        Some(key)
-    }
+    if key.is_empty() { None } else { Some(key) }
 }
 
 fn cache_path() -> Option<PathBuf> {
@@ -311,7 +318,10 @@ fn mtime_parts(t: std::time::SystemTime) -> (u64, u32) {
 }
 
 /// `None` = cache missing, unparsable, or keyed to different fonts.
-fn read_cache(path: &Path, key: &[(PathBuf, std::time::SystemTime)]) -> Option<Vec<(PathBuf, u32)>> {
+fn read_cache(
+    path: &Path,
+    key: &[(PathBuf, std::time::SystemTime)],
+) -> Option<Vec<(PathBuf, u32)>> {
     let text = std::fs::read_to_string(path).ok()?;
     let mut lines = text.lines();
     if lines.next()? != "rmenu-font-cache v1" {
@@ -426,7 +436,11 @@ mod tests {
                 break;
             }
             if p.is_dir() {
-                file = std::fs::read_dir(&p).unwrap().flatten().map(|e| e.path()).find(|q| is_font(q));
+                file = std::fs::read_dir(&p)
+                    .unwrap()
+                    .flatten()
+                    .map(|e| e.path())
+                    .find(|q| is_font(q));
                 if file.is_some() {
                     break;
                 }
@@ -434,7 +448,10 @@ mod tests {
         }
         let file = file.expect("a ttf/otf/ttc under /usr/share/fonts");
         let m = MenuFont::load(file.to_str(), 16.0).expect("font file loads");
-        assert!(m.fallbacks.is_empty(), "explicit file means no fallback chain");
+        assert!(
+            m.fallbacks.is_empty(),
+            "explicit file means no fallback chain"
+        );
         assert_eq!(m.size, 16.0);
     }
 
@@ -446,7 +463,11 @@ mod tests {
         let chain = system_chain();
         let big = chain
             .iter()
-            .filter(|(p, _)| std::fs::metadata(p).map(|m| m.len() > 8_000_000).unwrap_or(false))
+            .filter(|(p, _)| {
+                std::fs::metadata(p)
+                    .map(|m| m.len() > 8_000_000)
+                    .unwrap_or(false)
+            })
             .count();
         assert!(big <= 1, "at most one large (CJK) face in chain: {chain:?}");
     }
@@ -458,7 +479,10 @@ mod tests {
         let font = dir.join("a.ttf");
         std::fs::write(&font, b"font").unwrap();
         let path = dir.join("font-chain");
-        let key = vec![(font.clone(), std::fs::metadata(&font).unwrap().modified().unwrap())];
+        let key = vec![(
+            font.clone(),
+            std::fs::metadata(&font).unwrap().modified().unwrap(),
+        )];
         let chain = vec![(font.clone(), 3u32)];
         write_cache(&path, &key, &chain);
         assert_eq!(read_cache(&path, &key), Some(chain));
@@ -477,7 +501,11 @@ mod tests {
         let mut db = fontdb::Database::new();
         db.load_system_fonts();
         let sample = db.faces().find_map(|f| {
-            if !f.families.iter().any(|f| f.0.to_ascii_lowercase().contains("nerd font")) {
+            if !f
+                .families
+                .iter()
+                .any(|f| f.0.to_ascii_lowercase().contains("nerd font"))
+            {
                 return None;
             }
             db.with_face_data(f.id, |d, i| (d.to_vec(), i))
@@ -488,7 +516,9 @@ mod tests {
         let scaled = fv.as_scaled(PxScale::from(16.0));
         let Some(cp) = (0xF000..=0xFDFF)
             .find(|&cp| scaled.glyph_id(char::from_u32(cp).unwrap()) != GlyphId(0))
-        else { return };
+        else {
+            return;
+        };
         let m = MenuFont::load(None, 16.0).expect("system font available");
         assert!(
             m.has_glyph(char::from_u32(cp).unwrap()),
