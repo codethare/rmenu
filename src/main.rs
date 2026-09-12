@@ -4,6 +4,7 @@
 //! otherwise lines are read from stdin.
 
 mod anim;
+mod control;
 mod desktop;
 mod feed;
 mod font;
@@ -11,6 +12,7 @@ mod items;
 mod render;
 
 use anim::Anim;
+use control::Claim;
 use feed::ItemFeed;
 
 use std::io::IsTerminal;
@@ -18,7 +20,8 @@ use std::process::exit;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use smithay_client_toolkit::reexports::calloop::EventLoop;
+use smithay_client_toolkit::reexports::calloop::generic::Generic;
+use smithay_client_toolkit::reexports::calloop::{EventLoop, Interest, Mode, PostAction};
 use smithay_client_toolkit::reexports::calloop_wayland_source::WaylandSource;
 
 use smithay_client_toolkit::{
@@ -171,16 +174,25 @@ fn parse_opts() -> Opts {
 fn main() {
     let opts = parse_opts();
 
-    // `--run` data is local and cheap, so it loads synchronously. Stdin may
-    // come from a slow producer (`find / | rmenu`), so it streams in a thread
-    // while the menu is already on screen.
+    // Single instance: a repeat launch dismisses the panel that is already up
+    // instead of stacking another one on top of it (Wayland happily layers
+    // them, and each one has to be cancelled separately). Claimed before the
+    // font load and the Wayland connection, so a repeat launch costs ~1 ms and
+    // never creates a surface.
+    let control = control::claim();
+    if let Claim::Dismissed = control {
+        exit(1);
+    }
+
+    // `--run` scans `.desktop` files and `$PATH` on a thread: the scan used to
+    // run before the Wayland connection, so the bar could not appear until it
+    // finished. Items now arrive through the same queue stdin uses; an empty
+    // result still exits 1, via the `no_items` path in `sync_items`.
     let (items, feed): (Vec<items::Item>, Option<Arc<ItemFeed>>) = if opts.run {
-        let merged = desktop::merged(desktop::load_apps(), desktop::path_commands());
-        if merged.is_empty() {
-            eprintln!("rmenu: no items");
-            exit(1);
-        }
-        (merged, None)
+        let feed = ItemFeed::spawn_with(|| {
+            desktop::merged(desktop::load_apps(), desktop::path_commands())
+        });
+        (Vec::new(), Some(feed))
     } else {
         // Without a pipe (and without `--run`) this would just look hung while
         // it waits for stdin, so say what is happening. Behavior is unchanged.
@@ -217,6 +229,24 @@ fn main() {
             eprintln!("rmenu: {e}");
             exit(1);
         });
+    // The dismissal channel from `control::claim`: a second launch connecting
+    // to our socket closes this menu, exactly like Escape does. Level-triggered
+    // on the loop's poller, so idle wakeups are unchanged.
+    if let Claim::Owner(listener) = control {
+        loop_handle
+            .insert_source(
+                Generic::new(listener, Interest::READ, Mode::Level),
+                |_, listener, app: &mut App| {
+                    let _ = listener.accept();
+                    app.menu.done = Some(Done::Cancel);
+                    Ok(PostAction::Continue)
+                },
+            )
+            .unwrap_or_else(|e| {
+                eprintln!("rmenu: {e}");
+                exit(1);
+            });
+    }
     let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
     let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
     let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");

@@ -13,7 +13,8 @@ the whole UI is drawn by `ab_glyph`.
 - wmenu/dmenu-style filtering: every space-separated query token must be a
   substring; ranking is exact > prefix > substring
 - lists stream in: the menu shows immediately and rows fill in as stdin
-  produces them, so slow producers (`find / | rmenu`) stay responsive
+  produces them (and while `--run` scans `.desktop` files and `$PATH`), so slow
+  producers (`find / | rmenu`) stay responsive
 - `Ctrl`-free text input, `Up`/`Down`/`Ctrl-n`/`Ctrl-p`/`PgUp`/`PgDn`/`Home`/`End` navigation, key
   repeat, long-list scrolling, case-insensitive matching (`-i`), `Tab` completes
   the highlighted entry into the input; `Ctrl-c`/`Ctrl-g` cancel, `Ctrl-h`
@@ -32,6 +33,9 @@ the whole UI is drawn by `ab_glyph`.
   entries winning. Hidden entries, `Terminal=true` entries, entries for other
   desktops (`OnlyShowIn`/`NotShowIn`), and non-executable PATH files are
   skipped; a localized `Name[locale]` is preferred when it matches the locale.
+- one panel per Wayland session: launching `rmenu` again dismisses the running
+  menu (same as Escape, no output, exit 1) instead of stacking a second bar on
+  top of the first — so a launcher keybind toggles open/closed
 - CJK text renders (auto-picks a CJK-capable system font)
 
 ## Build / run

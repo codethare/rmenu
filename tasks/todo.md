@@ -77,3 +77,15 @@
 - [x] 2 stdin 为 tty 时提示（行为与退出码不变）
 - [x] 5 `draw_text` 裁剪边界断言（不越界写）
 - [x] 回归：75 passed；clippy 0；fmt clean
+# Todo: run-item-stream（1/2/5）
+
+- [x] T1 `feed.rs`：`spawn_with(producer)` + `spawn_worker` 共用线程外壳（`spawn()` 语义不变）+ 2 条断言
+- [x] T2 `main.rs`：`--run` 分支 → `ItemFeed::spawn_with(|| desktop::merged(...))`；删首帧前同步 `no_items` 退出
+- [x] T3 回归：81 passed；clippy `-D warnings` 0；fmt clean；README 补流式说明
+     实测（PATH 复制 500 份 ≈ 扫描 0.84 s）：首帧仍在 0.001 s，条目帧 0.840 s——扫描已不在关键路径
+# Todo: single-instance（1/2）
+
+- [x] T1 `control.rs`：`claim()`（Owner/Dismissed/Disabled）+ `socket_path_from` 纯函数 + 4 条 std 单测
+- [x] T2 `main.rs`：`parse_opts` 后 claim（Dismissed → exit 1，早于字体加载与 Wayland 连接）；`WaylandSource` 后 `insert_source(Generic)`
+- [x] T3 验收：A→1 实例 / B exit 1 且 `WAYLAND_DEBUG` 0 行 / 陈旧 socket 回收 / 无 XDG_RUNTIME_DIR 静默降级（2 实例并存）；
+     回归 81 passed + clippy 0 + fmt clean；README 补单实例一行

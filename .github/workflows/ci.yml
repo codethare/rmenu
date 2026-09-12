@@ -9,6 +9,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      # smithay-client-toolkit's build script pkg-configs xkbcommon; the runner
+      # image ships the runtime library but not the .pc file or the .so symlink.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

@@ -185,3 +185,21 @@
 - 文字起点改为硬编码推导，测试与实现必须同源
 
 验证检查点：全量 `cargo test` 55 passed；clippy 类型一致；ASCII 确认竖条/间距。
+# Plan: run-item-stream + single-instance（启动延迟 / 重复启动）
+
+两个需求都改 main.rs，**必须串行**：先做小的（run-item-stream），再做 single-instance（改事件循环装配）。
+
+1. run-item-stream（SPEC-run-item-stream.md）——`feed.rs` 加 `spawn_with(producer)`（`spawn()` 变薄壳）+ 2 条断言；`main.rs` 的 `--run` 分支改走后台 feed，删掉首帧前的同步 `no items` 退出。无依赖，先行。
+2. single-instance（SPEC-single-instance.md）——新 `control.rs`（`claim()` + 4 条 std 单测，Wayland 无关）；`main.rs` 在 `parse_opts` 后 claim、在 `WaylandSource` 之后 `insert_source(Generic)`。依赖 1（同一处 main.rs 启动段，避免同文件交叉改动）。
+3. 回归 + 文档——全量 `cargo test`；README 补两条（`--run` 列表流式填充；再次启动 = 关闭现有菜单）。
+
+风险：
+
+- run-item-stream：首帧后约 10 ms 内 Enter 会回退到「回显输入」（stdin 流式路径今天已如此，人手不可能命中）；`--run` 空结果由「不出现」变为「出现后 exit 1」。本机无「零 .desktop」环境，无法端到端造出该场景，靠 code path 不变兜底
+- single-instance：「旧实例被强杀留下死 socket」+「同一毫秒双启动」的竞态天花板（升级路径：bind 到 pid 名再 rename）；`XDG_RUNTIME_DIR` 缺失必须静默降级
+- 两者都不新增依赖；calloop `Generic` 走 sctk reexport 的 0.14.4
+
+验证检查点：
+
+- T1 后：`spawn_with` 不被慢 producer 阻塞的断言通过（producer sleep 150 ms，断言自身返回 < 50 ms）；首帧 `WAYLAND_DEBUG` 首个 commit 早于条目到达
+- T2 后：headless sway 连起 3 次 → `pgrep -c rmenu` == 1、sway 只登记 1 个 layer surface；`XDG_RUNTIME_DIR=` 空跑行为与改前一致；clippy/fmt 干净
