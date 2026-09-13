@@ -143,8 +143,8 @@ pub fn scroll_thumb(
 
 fn set_span(buf: &mut [u8], w: u32, y: u32, x0: u32, x1: u32, color: Bgra) {
     let row = &mut buf[(y * w + x0) as usize * 4..(y * w + x1) as usize * 4];
-    for px in row.chunks_exact_mut(4) {
-        px.copy_from_slice(&color);
+    for px in row.as_chunks_mut::<4>().0 {
+        *px = color;
     }
 }
 
@@ -304,8 +304,8 @@ pub fn rect(buf: &mut [u8], w: u32, h: u32, x: u32, y: u32, rw: u32, rh: u32, co
     let y1 = ((y + rh) as i64).clamp(0, h as i64) as u32;
     for py in y0..y1 {
         let row = &mut buf[(py * w + x0) as usize * 4..(py * w + x1) as usize * 4];
-        for px in row.chunks_exact_mut(4) {
-            px.copy_from_slice(&color);
+        for px in row.as_chunks_mut::<4>().0 {
+            *px = color;
         }
     }
 }
