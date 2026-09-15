@@ -8,7 +8,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       # xkbcommon: smithay-client-toolkit's build script pkg-configs it, and the
       # runner image ships only the runtime library. The fonts are test fixtures:
       # the font tests look up a latin-only face and a CJK face by family name.
