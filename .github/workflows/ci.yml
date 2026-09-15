@@ -9,9 +9,10 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      # smithay-client-toolkit's build script pkg-configs xkbcommon; the runner
-      # image ships the runtime library but not the .pc file or the .so symlink.
-      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev
+      # xkbcommon: smithay-client-toolkit's build script pkg-configs it, and the
+      # runner image ships only the runtime library. The fonts are test fixtures:
+      # the font tests look up a latin-only face and a CJK face by family name.
+      - run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev fonts-noto-mono fonts-wqy-microhei
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy

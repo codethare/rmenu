@@ -419,34 +419,10 @@ mod tests {
     #[test]
     fn file_spec_loads_exactly_that_font_without_chain() {
         // `-f /path.ttf` must not build the system chain: no fallbacks at all
-        // (wmenu -f semantics) — this is the fast-startup path.
-        let is_font = |p: &std::path::Path| {
-            p.is_file()
-                && p.extension()
-                    .and_then(|e| e.to_str())
-                    .map(|e| e.to_ascii_lowercase())
-                    .is_some_and(|e| e == "ttf" || e == "otf" || e == "ttc")
-        };
-        let root = std::path::Path::new("/usr/share/fonts");
-        let mut file = None;
-        for entry in std::fs::read_dir(root).unwrap().flatten() {
-            let p = entry.path();
-            if is_font(&p) {
-                file = Some(p);
-                break;
-            }
-            if p.is_dir() {
-                file = std::fs::read_dir(&p)
-                    .unwrap()
-                    .flatten()
-                    .map(|e| e.path())
-                    .find(|q| is_font(q));
-                if file.is_some() {
-                    break;
-                }
-            }
-        }
-        let file = file.expect("a ttf/otf/ttc under /usr/share/fonts");
+        // (wmenu -f semantics) — this is the fast-startup path. The path comes
+        // from the app's own discovery, so the test does not have to guess the
+        // layout (Arch keeps ttfs two levels down, Debian adds a family dir).
+        let (file, _) = system_chain().into_iter().next().expect("a system font");
         let m = MenuFont::load(file.to_str(), 16.0).expect("font file loads");
         assert!(
             m.fallbacks.is_empty(),
