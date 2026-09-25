@@ -10,7 +10,7 @@ pub const fn bgra(r: u8, g: u8, b: u8, a: u8) -> Bgra {
 }
 
 /// Spotlight panel corner radius (logical px), clamped to half the panel size.
-pub const CORNER_RADIUS: u32 = 10;
+pub const CORNER_RADIUS: u32 = 12;
 
 /// Fully transparent pixel: everything outside the rounded panel outline.
 const CLEAR: Bgra = [0, 0, 0, 0];
@@ -23,6 +23,12 @@ const PROMPT_GAP: f32 = 8.0;
 const PILL_VPAD: u32 = 2;
 /// Width of the label rail.
 const LABEL_RAIL_W: u32 = 4;
+/// Selected rows sit inside the panel instead of touching its sides.
+const SELECTION_INSET: u32 = 8;
+const SELECTION_RADIUS: u32 = 8;
+/// A logical-pixel divider at the input/list boundary.
+const DIVIDER_H: u32 = 1;
+const DIVIDER_ALPHA: u32 = 64;
 
 pub const BG_NORMAL: Bgra = bgra(0x22, 0x22, 0x22, 0xff);
 pub const FG_NORMAL: Bgra = bgra(0xbb, 0xbb, 0xbb, 0xff);
@@ -176,11 +182,13 @@ pub fn draw(
     let rail_w = LABEL_RAIL_W * s;
     let vpad = PILL_VPAD * s;
     let gap = PROMPT_GAP * s as f32;
+    let selection_inset = SELECTION_INSET * s;
+    let selection_radius = SELECTION_RADIUS * s;
     // `-P` masks the typed text; filtering still sees the real query.
     let query = masked_input(query, password);
 
     // Panel: rounded corners (transparent outside), input bar and list sharing
-    // one outline, separated only by the subtle background difference.
+    // one outline, separated by a subtle divider and background difference.
     // One pass, one write per pixel. The buffer can be a different slot each
     // frame, so pixels outside the rounded outline must be written too — but the
     // panel itself must not be painted twice (that second full-buffer write was
@@ -200,6 +208,23 @@ pub fn draw(
         if x1 < w {
             set_span(buf, w, y, x1, w, CLEAR);
         }
+    }
+
+    if h > row_h {
+        let divider_h = DIVIDER_H * s;
+        let divider_y = row_h - divider_h;
+        let (x0, x1) = rounded_span(w, h, r, divider_y);
+        let mut divider = colors.bg_prompt;
+        blend_px(
+            &mut divider,
+            [
+                colors.label_accent[0],
+                colors.label_accent[1],
+                colors.label_accent[2],
+            ],
+            DIVIDER_ALPHA,
+        );
+        rect(buf, w, h, x0, divider_y, x1 - x0, divider_h, divider);
     }
 
     // Prompt / input row text.
@@ -267,19 +292,26 @@ pub fn draw(
     }
 
     // Item rows (background already bg_normal from the panel pass; only the
-    // selected strip needs an override, clipped to the rounded outline).
+    // selected island needs an override, clipped to the rounded outline).
+    let selection_w = w.saturating_sub(selection_inset * 2);
     for (i, row) in rows.iter().enumerate() {
         let y = row_h * (i as u32 + 1);
         if row.selected {
             for yy in y..(y + row_h).min(h) {
-                let (x0, x1) = rounded_span(w, h, r, yy);
-                set_span(buf, w, yy, x0, x1, colors.bg_sel);
+                let (selection_x0, selection_x1) =
+                    rounded_span(selection_w, row_h, selection_radius, yy - y);
+                let (panel_x0, panel_x1) = rounded_span(w, h, r, yy);
+                let x0 = panel_x0.max(selection_inset + selection_x0);
+                let x1 = panel_x1.min(selection_inset + selection_x1);
+                if x0 < x1 {
+                    set_span(buf, w, yy, x0, x1, colors.bg_sel);
+                }
             }
         }
-        let (_, fg) = if row.selected {
-            (colors.bg_sel, colors.fg_sel)
+        let fg = if row.selected {
+            colors.fg_sel
         } else {
-            (colors.bg_normal, colors.fg_normal)
+            colors.fg_normal
         };
         draw_text(
             buf,
@@ -609,7 +641,7 @@ mod tests {
         // First text row must contain non-background pixels (glyph ink).
         let mut text_has_ink = false;
         'outer: for y in 2..24u32 {
-            for x in 2..200u32 {
+            for x in crate::PAD..200u32 {
                 let i = ((font.row_h + y) * w + x) as usize * 4;
                 if [buf[i], buf[i + 1], buf[i + 2], buf[i + 3]] != colors.bg_sel {
                     text_has_ink = true;
@@ -839,6 +871,63 @@ mod tests {
     }
 
     #[test]
+    fn selected_row_is_inset_rounded_and_list_has_divider() {
+        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let (w, h) = (240u32, font.row_h * 2);
+        let mut buf = vec![0u8; (w * h * 4) as usize];
+        let colors = Colors::default();
+        draw(
+            &mut buf,
+            w,
+            h,
+            &font,
+            "",
+            "",
+            false,
+            &[Row {
+                text: "",
+                selected: true,
+            }],
+            crate::PAD,
+            &colors,
+            1,
+            false,
+            Subpixel::Gray,
+        );
+        let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
+
+        let selection_mid = font.row_h + font.row_h / 2;
+        assert_eq!(px(SELECTION_INSET - 1, selection_mid), &colors.bg_normal);
+        assert_eq!(px(SELECTION_INSET, selection_mid), &colors.bg_sel);
+        assert_eq!(px(w - SELECTION_INSET, selection_mid), &colors.bg_normal);
+        assert_eq!(
+            px(w - SELECTION_INSET - 1, selection_mid),
+            &colors.bg_sel,
+            "selected background is symmetric"
+        );
+        assert_eq!(
+            px(SELECTION_INSET, font.row_h),
+            &colors.bg_normal,
+            "selection starts with a rounded corner"
+        );
+        assert_eq!(
+            px(
+                SELECTION_INSET + SELECTION_RADIUS,
+                font.row_h + SELECTION_RADIUS
+            ),
+            &colors.bg_sel
+        );
+
+        let divider = px(w / 2, font.row_h - 1);
+        assert_ne!(divider, &colors.bg_prompt);
+        assert_ne!(divider, &colors.bg_normal);
+        for (c, value) in divider.iter().copied().take(3).enumerate() {
+            assert!(value >= colors.bg_prompt[c].min(colors.label_accent[c]));
+            assert!(value <= colors.bg_prompt[c].max(colors.label_accent[c]));
+        }
+    }
+
+    #[test]
     fn prompt_label_is_a_left_rail_over_an_uniform_bar() {
         let def = Colors::default();
         assert_ne!(
@@ -1062,7 +1151,7 @@ mod tests {
     /// HiDPI: geometry constants are logical and scale with the buffer density.
     #[test]
     fn hidpi_scale_doubles_the_buffer_geometry() {
-        let font = MenuFont::load(None, 16.0).expect("system font available");
+        let font = MenuFont::load(None, 32.0).expect("system font available");
         let (w, h) = (480u32, font.row_h * 2);
         let mut buf = vec![0u8; (w * h * 4) as usize];
         let def = Colors::default();
@@ -1074,7 +1163,10 @@ mod tests {
             "address",
             "",
             false,
-            &[],
+            &[Row {
+                text: "",
+                selected: true,
+            }],
             crate::PAD,
             &def,
             2,
@@ -1084,7 +1176,7 @@ mod tests {
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
         let mid = font.row_h / 2;
 
-        // Padding 12 -> 24, rail width 4 -> 8.
+        // Padding 16 -> 32, rail width 4 -> 8.
         let rail_x = crate::PAD * 2;
         assert_eq!(
             px(rail_x, mid),
@@ -1101,7 +1193,25 @@ mod tests {
             &def.bg_prompt,
             "past the scaled rail"
         );
-        // Panel corner radius 10 -> 20: the first buffer row is inset further.
+
+        let selection_mid = font.row_h + font.row_h / 2;
+        assert_eq!(
+            px(SELECTION_INSET * 2 - 1, selection_mid),
+            &def.bg_normal,
+            "selection inset scales with density"
+        );
+        assert_eq!(
+            px(SELECTION_INSET * 2, selection_mid),
+            &def.bg_sel,
+            "scaled selection starts at the inset"
+        );
+        assert_ne!(
+            px(w / 2, font.row_h - 1),
+            &def.bg_prompt,
+            "logical divider scales to physical pixels"
+        );
+
+        // Panel corner radius 12 -> 24: the first buffer row is inset further.
         let (x0, _) = rounded_span(w, h, CORNER_RADIUS * 2, 0);
         assert!(x0 > CORNER_RADIUS, "corner inset scales with density: {x0}");
     }

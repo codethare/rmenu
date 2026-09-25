@@ -203,3 +203,12 @@
 
 - T1 后：`spawn_with` 不被慢 producer 阻塞的断言通过（producer sleep 150 ms，断言自身返回 < 50 ms）；首帧 `WAYLAND_DEBUG` 首个 commit 早于条目到达
 - T2 后：headless sway 连起 3 次 → `pgrep -c rmenu` == 1、sway 只登记 1 个 layer surface；`XDG_RUNTIME_DIR=` 空跑行为与改前一致；clippy/fmt 干净
+# Plan: UI-001 panel polish
+
+1. 固定视觉参数：圆角 10→12 px、内容边距 12→16 px、选中项左右内缩 8 px、圆角 8 px。
+2. 复用 `rounded_span` 绘制内缩选中项，并在输入/结果区之间加入 1 逻辑像素分隔线；所有几何随 HiDPI scale 缩放。
+3. 补充分隔线、选中项内缩/圆角和 2x 像素断言；不改颜色、宽度、行高、动画、键盘或 stdin/stdout 契约。
+
+风险：第一/最后结果行仍需裁剪到外层圆角；分隔线不得碰到文字墨迹；默认颜色和 wmenu flags 保持不变。
+
+验证检查点：`cargo fmt --check`、`cargo clippy`、全量 82 tests passed。

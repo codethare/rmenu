@@ -89,3 +89,9 @@
 - [x] T2 `main.rs`：`parse_opts` 后 claim（Dismissed → exit 1，早于字体加载与 Wayland 连接）；`WaylandSource` 后 `insert_source(Generic)`
 - [x] T3 验收：A→1 实例 / B exit 1 且 `WAYLAND_DEBUG` 0 行 / 陈旧 socket 回收 / 无 XDG_RUNTIME_DIR 静默降级（2 实例并存）；
      回归 81 passed + clippy 0 + fmt clean；README 补单实例一行
+# Todo: UI-001 panel polish
+
+- [x] 圆角 12 px、内容边距 16 px
+- [x] 选中项 8 px 内缩 / 8 px 圆角，输入区加入 1 px 分隔线
+- [x] 补充分隔线、选中项形状和 HiDPI 像素断言
+- [x] 回归：82 passed；clippy 0；fmt clean

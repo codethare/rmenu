@@ -56,7 +56,7 @@ const FONT_SIZE: f32 = 16.0;
 /// or `Gray` for neutral rendering without colour fringing.
 const TEXT_AA: render::Subpixel = render::Subpixel::Rgb;
 /// Panel content inset: must be >= corner radius so text never grazes the curve.
-const PAD: u32 = 12;
+const PAD: u32 = 16;
 /// Away-from-edge float for the upper-center panel (bottom mode keeps 8px).
 const TOP_MARGIN: i32 = 32;
 /// ponytail: stdin can be huge; cap drawn rows and scroll instead of mapping a giant buffer.
