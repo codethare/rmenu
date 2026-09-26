@@ -23,9 +23,6 @@ const PROMPT_GAP: f32 = 8.0;
 const PILL_VPAD: u32 = 2;
 /// Width of the label rail.
 const LABEL_RAIL_W: u32 = 4;
-/// Selected rows sit inside the panel instead of touching its sides.
-const SELECTION_INSET: u32 = 8;
-const SELECTION_RADIUS: u32 = 8;
 /// A logical-pixel divider at the input/list boundary.
 const DIVIDER_H: u32 = 1;
 const DIVIDER_ALPHA: u32 = 64;
@@ -182,8 +179,6 @@ pub fn draw(
     let rail_w = LABEL_RAIL_W * s;
     let vpad = PILL_VPAD * s;
     let gap = PROMPT_GAP * s as f32;
-    let selection_inset = SELECTION_INSET * s;
-    let selection_radius = SELECTION_RADIUS * s;
     // `-P` masks the typed text; filtering still sees the real query.
     let query = masked_input(query, password);
 
@@ -292,20 +287,13 @@ pub fn draw(
     }
 
     // Item rows (background already bg_normal from the panel pass; only the
-    // selected island needs an override, clipped to the rounded outline).
-    let selection_w = w.saturating_sub(selection_inset * 2);
+    // selected row needs an override, clipped to the rounded outline).
     for (i, row) in rows.iter().enumerate() {
         let y = row_h * (i as u32 + 1);
         if row.selected {
             for yy in y..(y + row_h).min(h) {
-                let (selection_x0, selection_x1) =
-                    rounded_span(selection_w, row_h, selection_radius, yy - y);
-                let (panel_x0, panel_x1) = rounded_span(w, h, r, yy);
-                let x0 = panel_x0.max(selection_inset + selection_x0);
-                let x1 = panel_x1.min(selection_inset + selection_x1);
-                if x0 < x1 {
-                    set_span(buf, w, yy, x0, x1, colors.bg_sel);
-                }
+                let (x0, x1) = rounded_span(w, h, r, yy);
+                set_span(buf, w, yy, x0, x1, colors.bg_sel);
             }
         }
         let fg = if row.selected {
@@ -871,7 +859,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_row_is_inset_rounded_and_list_has_divider() {
+    fn selected_row_covers_full_width_and_list_has_divider() {
         let font = MenuFont::load(None, 16.0).expect("system font available");
         let (w, h) = (240u32, font.row_h * 2);
         let mut buf = vec![0u8; (w * h * 4) as usize];
@@ -896,27 +884,11 @@ mod tests {
         );
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
 
-        let selection_mid = font.row_h + font.row_h / 2;
-        assert_eq!(px(SELECTION_INSET - 1, selection_mid), &colors.bg_normal);
-        assert_eq!(px(SELECTION_INSET, selection_mid), &colors.bg_sel);
-        assert_eq!(px(w - SELECTION_INSET, selection_mid), &colors.bg_normal);
-        assert_eq!(
-            px(w - SELECTION_INSET - 1, selection_mid),
-            &colors.bg_sel,
-            "selected background is symmetric"
-        );
-        assert_eq!(
-            px(SELECTION_INSET, font.row_h),
-            &colors.bg_normal,
-            "selection starts with a rounded corner"
-        );
-        assert_eq!(
-            px(
-                SELECTION_INSET + SELECTION_RADIUS,
-                font.row_h + SELECTION_RADIUS
-            ),
-            &colors.bg_sel
-        );
+        let selection_y = font.row_h + 1;
+        assert_eq!(px(0, selection_y), &colors.bg_sel);
+        assert_eq!(px(w - 1, selection_y), &colors.bg_sel);
+        assert_eq!(px(0, h - 1), &CLEAR, "outer corner stays transparent");
+        assert_eq!(px(w - 1, h - 1), &CLEAR);
 
         let divider = px(w / 2, font.row_h - 1);
         assert_ne!(divider, &colors.bg_prompt);
@@ -1194,17 +1166,9 @@ mod tests {
             "past the scaled rail"
         );
 
-        let selection_mid = font.row_h + font.row_h / 2;
-        assert_eq!(
-            px(SELECTION_INSET * 2 - 1, selection_mid),
-            &def.bg_normal,
-            "selection inset scales with density"
-        );
-        assert_eq!(
-            px(SELECTION_INSET * 2, selection_mid),
-            &def.bg_sel,
-            "scaled selection starts at the inset"
-        );
+        let selection_y = font.row_h + 1;
+        assert_eq!(px(0, selection_y), &def.bg_sel);
+        assert_eq!(px(w - 1, selection_y), &def.bg_sel);
         assert_ne!(
             px(w / 2, font.row_h - 1),
             &def.bg_prompt,

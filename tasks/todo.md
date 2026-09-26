@@ -95,3 +95,8 @@
 - [x] 选中项 8 px 内缩 / 8 px 圆角，输入区加入 1 px 分隔线
 - [x] 补充分隔线、选中项形状和 HiDPI 像素断言
 - [x] 回归：82 passed；clippy 0；fmt clean
+# Todo: UI-002 full-row selection
+
+- [x] 选中背景恢复整行覆盖，删除内缩/圆角常量
+- [x] 更新全宽覆盖与外层圆角裁剪断言
+- [x] 回归：82 passed；clippy 0；fmt clean

@@ -212,3 +212,12 @@
 风险：第一/最后结果行仍需裁剪到外层圆角；分隔线不得碰到文字墨迹；默认颜色和 wmenu flags 保持不变。
 
 验证检查点：`cargo fmt --check`、`cargo clippy`、全量 82 tests passed。
+# Plan: UI-002 full-row selection
+
+1. 删除选中项 8 px 内缩/圆角常量，恢复按外层 `rounded_span` 覆盖整行。
+2. 更新像素断言：选中行左右边缘均为 `bg_sel`，分隔线和 2x 断言保持不变。
+3. 回归格式、测试与 Clippy；不改颜色、几何或交互契约。
+
+风险：首行/末行仍必须被外层圆角裁剪，不能覆盖透明角外像素。
+
+验证检查点：全量 `cargo test`、`cargo fmt --check`、`cargo clippy`。
