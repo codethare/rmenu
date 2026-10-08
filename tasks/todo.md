@@ -100,3 +100,30 @@
 - [x] 选中背景恢复整行覆盖，删除内缩/圆角常量
 - [x] 更新全宽覆盖与外层圆角裁剪断言
 - [x] 回归：82 passed；clippy 0；fmt clean
+# Todo: startup-font-latency
+
+- [x] P1 serve-stale 字体链 + 后台重扫（`cache_use` 断言 + `read_chain` 断言）
+- [x] P2 `-f FAMILY` 解析结果复用 font-chain 缓存（`family_file_name` 断言）
+- [x] P3 字体加载线程化 + 精确临时 row_h 先提交 + 首帧 join
+      SPEC：`openspec/specs/SPEC-startup-font-overlap.md`；`row_h_for`/`spec_size` 纯函数 + 不变量断言
+      实测：默认 21–32 ms（同批 `-f FILE` 18–28 ms，改前两者差 ~10–20 ms）；`-f FAMILY` 22–32 ms；
+      「提交 → 首次 attach」间隙 4.4–11.5 ms（改前 2.1–2.7 ms）→ 证明提交先于 join；
+      `-f "Noto Sans Mono 20px"` 首帧 set_size 与提交一致（640,30），默认 24/24，无补正；
+      scale 2：`set_buffer_scale(2)` 生效、无 panic、set_size 24→12（缓出起点，与父提交逐行相同）；
+      `-f "No Such Font"` / `/nonexistent` → exit 1 + 原文案；空 stdin → `no items` exit 1；单实例仍 dismiss
+- [x] 附带发现（未修，见 SPEC）：`-o NAME` 完全不可用 —— `Connection::roundtrip()` 不 dispatch
+      `registry_queue_init` 的队列，`OutputState::info()` 恒为 None；属独立改动
+- [x] P4 链路改 mono 主字体 + CJK/图标惰性
+      SPEC：`openspec/specs/SPEC-font-chain-lazy.md`；`FaceState` + `face(i)` 按需读 + 失败不重试
+      实测：默认 17–31 ms（中位 20）与 `-f FILE` 15–20（中位 19）齐平；改前中位差 ~3 ms；
+      `-p 中文` 首帧 +4–8 ms（惰性读 27MB TTC）；CJK/Nerd 渲染断言全绿
+      发现并修：缓存缺「策略号」→ 旧链（CJK 在前）会被当 fresh 而静默失效，新增 `p\t2` 行参与键校验
+- [x] `-o NAME` 修复（附带发现）
+      SPEC：`openspec/specs/SPEC-output-select-fix.md`；App 先构造（`layer: None`）→ `event_queue.roundtrip(&mut app)`
+      → 查名 → 再建 layer surface + 装配 loop source
+      实测：`-o HEADLESS-1` → `enter(wl_output@8)`（= HEADLESS-1）、`-o HEADLESS-2` → `enter(wl_output@7)`；
+      `-o nope` → exit 1 原文案；不带 `-o` 仅 0 次额外 sync，带 `-o` 恰 1 次
+- [x] 回归：87 passed（+3 断言）；fmt clean；clippy 无新增（font.rs/main.rs 0 条；render.rs 19 条为存量）
+      实测（headless sway）：人为把 font-chain 键改脏 → 首帧 36–62 ms（改前同条件 2927 ms），
+      长活实例 1–2 s 后缓存被后台重扫写回正确键；
+      `-f FAMILY` 62–76 ms → 35–45 ms（与默认路径持平）；默认路径 26–50 ms 不变

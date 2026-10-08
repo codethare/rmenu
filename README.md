@@ -36,7 +36,9 @@ the whole UI is drawn by `ab_glyph`.
 - one panel per Wayland session: launching `rmenu` again dismisses the running
   menu (same as Escape, no output, exit 1) instead of stacking a second bar on
   top of the first — so a launcher keybind toggles open/closed
-- CJK text renders (auto-picks a CJK-capable system font)
+- CJK text renders: a small Latin mono face is the primary font and the
+  CJK/icon faces are read on demand, so startup does not pay for the 27MB CJK
+  face unless a glyph actually needs it
 
 ## Build / run
 

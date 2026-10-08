@@ -1,10 +1,11 @@
-//! Font loading: an explicit font path, or an auto-picked system font
-//! (CJK-capable preferred so Chinese labels render).
+//! Font loading: an explicit font path, or an auto-picked system font (a small
+//! Latin face first, with CJK-capable faces read on demand so Chinese labels
+//! still render).
 
 #[cfg(test)]
 use ab_glyph::GlyphId;
 use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
-use std::cell::RefCell;
+use std::cell::{Ref, RefCell};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
@@ -33,9 +34,13 @@ pub struct GlyphBitmap {
 pub type GlyphKey = (u8, u16, u8, u8, u8);
 
 pub struct MenuFont {
-    pub font: FontVec,
-    /// Extra faces tried in order when the primary lacks a glyph (CJK etc.).
-    pub fallbacks: Vec<FontVec>,
+    /// Chain faces, index 0 = primary. Beyond the primary a face is only read
+    /// when a glyph actually needs it: the CJK face is 27MB, which used to be
+    /// read before the first frame just to draw Latin text.
+    faces: RefCell<Vec<FaceState>>,
+    /// Paths for faces 1.., parallel to `faces`; the index stays stable so the
+    /// glyph cache keys stay valid across lazy loads.
+    chain: Vec<(PathBuf, u32)>,
     /// Pixel size (em height).
     pub size: f32,
     pub ascent_px: f32,
@@ -48,6 +53,52 @@ pub struct MenuFont {
     /// (~8.4 ms measured). Discarded wholesale when the font is re-derived
     /// for a new scale, so a scale change cannot serve stale bitmaps.
     pub glyphs: RefCell<HashMap<GlyphKey, GlyphBitmap>>,
+}
+
+enum FaceState {
+    Loaded(FontVec),
+    /// Not read yet (`chain[i - 1]`).
+    Unread,
+    /// Read or parse failed: never retried, or every missing glyph would pay
+    /// for the failing I/O again.
+    Failed,
+}
+
+/// An in-flight font load: started before the Wayland handshake, joined by the
+/// event loop when it first needs a frame.
+pub(crate) type FontLoad = std::thread::JoinHandle<Result<MenuFont, String>>;
+
+/// Load `spec` on a thread, so the read + parse overlap the handshake instead
+/// of preceding it. Joining is the caller's business.
+pub(crate) fn spawn_load(spec: Option<String>, size: f32) -> FontLoad {
+    std::thread::spawn(move || MenuFont::load(spec.as_deref(), size))
+}
+
+/// Row height incl. padding, from the size alone: ab_glyph's scaled `height()`
+/// is just the requested `PxScale`, so this is face-independent and the layer
+/// surface can be committed at its final height before any font is loaded.
+/// Comfortable row height ≈1.5× font size: glyphs breathe top/bottom (the
+/// vertical pad is a quarter of the em on each side), and the tall selection
+/// band is an easier target to hit (Fitts).
+pub(crate) fn row_h_for(size: f32) -> u32 {
+    size.ceil() as u32 + 2 * (size * 0.25).round() as u32
+}
+
+/// The pixel size `load` will use for `spec`: an existing path is read as a font
+/// file and carries no size token, otherwise the token (or the default) wins.
+/// Mirrors `load`'s branch without reading the file — the point is to know the
+/// height before the load runs.
+/// ponytail: `exists()` can lie (a path that exists but is unreadable sends
+/// `load` down the family branch, so the height can be off by one row); the
+/// first frame's `set_size` corrects it.
+pub(crate) fn spec_size(spec: Option<&str>, default: f32) -> f32 {
+    let spec = spec.map(str::trim);
+    if let Some(s) = spec
+        && Path::new(s).exists()
+    {
+        return default;
+    }
+    spec.and_then(|s| parse_spec(s).2).unwrap_or(default)
 }
 
 impl MenuFont {
@@ -78,32 +129,25 @@ impl MenuFont {
         };
         let font = FontVec::try_from_vec_and_index(bytes, index)
             .map_err(|e| format!("invalid font: {e}"))?;
-        // With no `-f` the chain's head is the primary; skip it in the fallbacks.
+        // With no `-f` the chain's head is the primary; the rest of the chain
+        // becomes the lazily-read fallbacks.
         let skip = usize::from(spec.is_none());
-        let fallbacks: Vec<FontVec> = chain
-            .into_iter()
-            .skip(skip)
-            .filter_map(|(path, i)| {
-                let bytes = std::fs::read(path).ok()?;
-                FontVec::try_from_vec_and_index(bytes, i).ok()
-            })
-            .collect();
-        Ok(Self::build(font, fallbacks, size))
+        let chain: Vec<(PathBuf, u32)> = chain.into_iter().skip(skip).collect();
+        Ok(Self::build(font, chain, size))
     }
 
-    fn build(font: FontVec, fallbacks: Vec<FontVec>, size: f32) -> MenuFont {
+    fn build(font: FontVec, chain: Vec<(PathBuf, u32)>, size: f32) -> MenuFont {
         let scaled = font.as_scaled(PxScale::from(size));
         let ascent_px = scaled.ascent();
         let descent_px = scaled.descent();
         let line_h = scaled.height(); // == size by definition of PxScale
-        // Comfortable row height ≈1.5× font size: glyphs breathe top/bottom
-        // (the vertical pad is a quarter of the em on each side), and the tall
-        // selection band is an easier target to hit (Fitts). Derived from the
-        // size so the ratio survives HiDPI scales.
-        let row_h = line_h.ceil() as u32 + 2 * (size * 0.25).round() as u32;
+        let row_h = row_h_for(size);
+        let faces = std::iter::once(FaceState::Loaded(font))
+            .chain(chain.iter().map(|_| FaceState::Unread))
+            .collect();
         MenuFont {
-            font,
-            fallbacks,
+            faces: RefCell::new(faces),
+            chain,
             size,
             ascent_px,
             descent_px,
@@ -113,12 +157,64 @@ impl MenuFont {
         }
     }
 
+    /// Faces in the chain, primary included.
+    pub fn face_count(&self) -> usize {
+        self.faces.borrow().len()
+    }
+
+    /// Chain face `i` (0 = primary, always loaded), read on first use. `None`
+    /// when that face cannot be read or parsed, so the chain skips it.
+    pub fn face(&self, i: usize) -> Option<Ref<'_, FontVec>> {
+        let unread = matches!(self.faces.borrow().get(i), Some(FaceState::Unread));
+        if unread {
+            let read = i
+                .checked_sub(1)
+                .and_then(|k| self.chain.get(k))
+                .and_then(|(path, index)| read_face(path, *index));
+            if let Some(slot) = self.faces.borrow_mut().get_mut(i) {
+                *slot = match read {
+                    Some(font) => FaceState::Loaded(font),
+                    None => FaceState::Failed,
+                };
+            }
+        }
+        Ref::filter_map(self.faces.borrow(), |faces| match faces.get(i) {
+            Some(FaceState::Loaded(font)) => Some(font),
+            _ => None,
+        })
+        .ok()
+    }
+
+    /// Chain index + glyph id for `ch`, reading faces on demand.
+    #[cfg(test)]
+    fn glyph_for(&self, ch: char) -> Option<(usize, GlyphId)> {
+        for i in 0..self.face_count() {
+            let Some(face) = self.face(i) else {
+                continue;
+            };
+            let gid = face.as_scaled(PxScale::from(self.size)).glyph_id(ch);
+            if gid != GlyphId(0) {
+                return Some((i, gid));
+            }
+        }
+        None
+    }
+
     /// True if any face in the chain (primary first) has a glyph for `ch`.
     #[cfg(test)]
     pub fn has_glyph(&self, ch: char) -> bool {
-        std::iter::once(&self.font)
-            .chain(self.fallbacks.iter())
-            .any(|f| f.as_scaled(PxScale::from(self.size)).glyph_id(ch) != GlyphId(0))
+        self.glyph_for(ch).is_some()
+    }
+
+    /// Faces not read yet (test-only): startup must read nothing but the
+    /// primary.
+    #[cfg(test)]
+    fn unread_faces(&self) -> usize {
+        self.faces
+            .borrow()
+            .iter()
+            .filter(|f| matches!(f, FaceState::Unread))
+            .count()
     }
 }
 
@@ -178,7 +274,24 @@ fn weight_of(word: &str) -> Option<fontdb::Weight> {
     }
 }
 
+/// Family name → bytes, through the on-disk cache: the lookup underneath is a
+/// full fontdb scan (it parses every installed font header, ~40ms here) and it
+/// used to run on every single launch of `-f FAMILY`.
 fn query_family(family: &str, weight: fontdb::Weight) -> Option<(Vec<u8>, u32)> {
+    let (path, index) = cached_family_path(family, weight)?;
+    let bytes = std::fs::read(&path).ok()?;
+    Some((bytes, index))
+}
+
+fn cached_family_path(family: &str, weight: fontdb::Weight) -> Option<(PathBuf, u32)> {
+    let fam = family.to_string();
+    let scan = move || query_family_path(&fam, weight).into_iter().collect();
+    cached_chain(family_cache_path(family, weight), cache_key(), scan)
+        .into_iter()
+        .next()
+}
+
+fn query_family_path(family: &str, weight: fontdb::Weight) -> Option<(PathBuf, u32)> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
     let fam = fontdb::Family::Name(family);
@@ -189,11 +302,13 @@ fn query_family(family: &str, weight: fontdb::Weight) -> Option<(Vec<u8>, u32)> 
     };
     db.query(&q(weight))
         .or_else(|| db.query(&q(fontdb::Weight::NORMAL)))
-        .and_then(|id| copy_face(&db, id))
+        .and_then(|id| face_path(&db, id))
 }
 
 /// CJK-preferring ordered list of usable system font paths (primary candidate
-/// first), used both for auto-pick and as the fallback chain.
+/// first), used both for auto-pick and as the fallback chain. Mono leads: it is
+/// 0.6MB against the CJK face's 27MB, and only the leading face is read at load
+/// time (the rest are read on demand).
 fn system_chain() -> Vec<(PathBuf, u32)> {
     let mut db = fontdb::Database::new();
     db.load_system_fonts();
@@ -209,15 +324,15 @@ fn system_chain() -> Vec<(PathBuf, u32)> {
     ];
     const MONO: &[&str] = &["Noto Sans Mono", "DejaVu Sans Mono", "Liberation Mono"];
     let mut out = Vec::new();
+    for fam in MONO {
+        if let Some(found) = query_path(&db, fam) {
+            out.push(found);
+        }
+    }
     for fam in CJK {
         if let Some(found) = query_path(&db, fam) {
             out.push(found);
             break;
-        }
-    }
-    for fam in MONO {
-        if let Some(found) = query_path(&db, fam) {
-            out.push(found);
         }
     }
     // Nerd Font PUA icons (patched families / "Symbols Nerd Font"): the mono
@@ -262,24 +377,81 @@ fn face_path(db: &fontdb::Database, id: fontdb::ID) -> Option<(PathBuf, u32)> {
     Some((path, face.index))
 }
 
-/// Persistent cache of the resolved system chain, so the ~100ms fontdb scan
-/// (it parses every installed font header on each launch; on this box that is
-/// 2193 files / 756MB) only runs when fonts actually change. Keyed on the
-/// standard font dirs' mtimes — the same trick as fontconfig's fc-cache.
+/// Read + parse one chain face. Best-effort: a font that cannot be loaded is
+/// skipped by the chain.
+fn read_face(path: &Path, index: u32) -> Option<FontVec> {
+    let bytes = std::fs::read(path).ok()?;
+    FontVec::try_from_vec_and_index(bytes, index).ok()
+}
+
+/// Persistent cache of the resolved system chain, so the fontdb scan (it parses
+/// every installed font header: 655 files / 422MB here) only runs when fonts
+/// actually change. Keyed on the standard font dirs' mtimes — the same trick as
+/// fontconfig's fc-cache.
 /// ponytail: dirs from a custom /etc/fonts/fonts.conf aren't keyed, so chain
-/// changes there go unnoticed until a keyed dir changes; `-f FAMILY` rescans anyway.
+/// changes there go unnoticed until a keyed dir changes.
 fn cached_system_chain() -> Vec<(PathBuf, u32)> {
-    let (Some(key), Some(path)) = (cache_key(), cache_path()) else {
-        return system_chain(); // no XDG_CACHE_HOME/HOME — scan every launch
-    };
-    if let Some(chain) = read_cache(&path, &key)
-        && chain.iter().all(|(p, _)| p.exists())
-    {
-        return chain;
+    cached_chain(cache_path(), cache_key(), system_chain)
+}
+
+/// What the on-disk cache is worth this launch.
+enum CacheUse {
+    Fresh(Vec<(PathBuf, u32)>),
+    /// Key changed (a font package touched a dir) or a chain path vanished, but
+    /// every cached path is still there: a usable font choice, so use it now
+    /// and refresh the cache on a thread.
+    Stale(Vec<(PathBuf, u32)>),
+    /// Nothing usable: compute now.
+    None,
+}
+
+/// `fresh` is the cache read with the current key, `any` the same file read
+/// without key validation; either is usable only while every path still exists.
+fn cache_use(
+    fresh: Option<Vec<(PathBuf, u32)>>,
+    any: Option<Vec<(PathBuf, u32)>>,
+    exists: impl Fn(&Path) -> bool,
+) -> CacheUse {
+    let usable = |c: Option<Vec<(PathBuf, u32)>>| c.filter(|c| c.iter().all(|(p, _)| exists(p)));
+    match (usable(fresh), usable(any)) {
+        (Some(chain), _) => CacheUse::Fresh(chain),
+        (None, Some(chain)) => CacheUse::Stale(chain),
+        (None, None) => CacheUse::None,
     }
-    let chain = system_chain();
-    write_cache(&path, &key, &chain);
-    chain
+}
+
+/// Run `scan` through the cache at `path`: fresh → as-is; stale but usable →
+/// as-is, with `scan` re-run on a thread to refresh the cache for the next
+/// launch; no usable cache → `scan` now. A stale key used to block the first
+/// frame on the scan itself (~40-90ms warm here, seconds when the font files
+/// are cold too).
+fn cached_chain(
+    path: Option<PathBuf>,
+    key: Option<Vec<(PathBuf, std::time::SystemTime)>>,
+    scan: impl Fn() -> Vec<(PathBuf, u32)> + Send + 'static,
+) -> Vec<(PathBuf, u32)> {
+    let (Some(path), Some(key)) = (path, key) else {
+        return scan(); // no XDG_CACHE_HOME/HOME — scan every launch
+    };
+    match cache_use(read_cache(&path, &key), read_chain(&path), Path::exists) {
+        CacheUse::Fresh(chain) => chain,
+        CacheUse::Stale(chain) => {
+            std::thread::spawn(move || {
+                let chain = scan();
+                // The key is re-read: the launch that found it stale is the very
+                // reason it changed.
+                if let Some(key) = cache_key() {
+                    write_cache(&path, &key, &chain);
+                }
+            });
+            chain
+        }
+        CacheUse::None => {
+            let chain = scan();
+            write_cache(&path, &key, &chain);
+            chain
+        }
+    }
 }
 
 /// Standard user/system font dirs (fontdb's no-fontconfig scan list); their
@@ -303,11 +475,45 @@ fn cache_key() -> Option<Vec<(PathBuf, std::time::SystemTime)>> {
     if key.is_empty() { None } else { Some(key) }
 }
 
-fn cache_path() -> Option<PathBuf> {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+fn cache_dir() -> Option<PathBuf> {
+    std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))?;
-    Some(base.join("rmenu").join("font-chain"))
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
+        .map(|base| base.join("rmenu"))
+}
+
+fn cache_path() -> Option<PathBuf> {
+    Some(cache_dir()?.join("font-chain"))
+}
+
+/// One file per `-f FAMILY [style]` lookup; the size token doesn't affect
+/// resolution, so it stays out of the name.
+fn family_cache_path(family: &str, weight: fontdb::Weight) -> Option<PathBuf> {
+    Some(cache_dir()?.join(family_file_name(family, weight)))
+}
+
+fn family_file_name(family: &str, weight: fontdb::Weight) -> String {
+    let token: String = family
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || "._-".contains(c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("font-family-{}-{token}", weight.0)
+}
+
+/// Bump when the chain's *meaning* changes (order, membership rules): the font
+/// dirs' mtimes will not have moved, so the old file would otherwise be served
+/// as if the new resolver had produced it.
+const CACHE_POLICY: u32 = 2;
+
+fn policy_line() -> String {
+    format!("p\t{CACHE_POLICY}")
 }
 
 fn mtime_parts(t: std::time::SystemTime) -> (u64, u32) {
@@ -327,6 +533,12 @@ fn read_cache(
     if lines.next()? != "rmenu-font-cache v1" {
         return None;
     }
+    // The resolver's policy is part of the key: a new chain order must not be
+    // served from an old file (dir mtimes alone would not notice). Mismatch
+    // lands in the serve-stale path, so the change costs no latency.
+    if lines.next()? != policy_line() {
+        return None;
+    }
     for (dir, mt) in key {
         let mut it = lines.next()?.splitn(4, '\t');
         let (tag, d, s, n) = (
@@ -339,6 +551,20 @@ fn read_cache(
             return None;
         }
     }
+    parse_chain(lines)
+}
+
+/// The cached chain regardless of the key: what a stale cache still offers.
+fn read_chain(path: &Path) -> Option<Vec<(PathBuf, u32)>> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "rmenu-font-cache v1" {
+        return None;
+    }
+    parse_chain(lines.skip_while(|l| l.starts_with("d\t") || l.starts_with("p\t")))
+}
+
+fn parse_chain<'a>(lines: impl Iterator<Item = &'a str>) -> Option<Vec<(PathBuf, u32)>> {
     let mut chain = Vec::new();
     for line in lines {
         let mut it = line.splitn(3, '\t');
@@ -360,6 +586,8 @@ fn write_cache(path: &Path, key: &[(PathBuf, std::time::SystemTime)], chain: &[(
         return;
     }
     let mut text = String::from("rmenu-font-cache v1\n");
+    text.push_str(&policy_line());
+    text.push('\n');
     for (dir, mt) in key {
         let Some(d) = dir.to_str() else { return };
         let (s, n) = mtime_parts(*mt);
@@ -375,14 +603,10 @@ fn write_cache(path: &Path, key: &[(PathBuf, std::time::SystemTime)], chain: &[(
     if let Some(dir) = path.parent() {
         let _ = std::fs::create_dir_all(dir);
     }
-    let tmp = path.with_extension("tmp");
+    let tmp = path.with_extension(format!("tmp-{}", std::process::id()));
     if std::fs::write(&tmp, text).is_ok() {
         let _ = std::fs::rename(&tmp, path); // atomic: never serve a torn cache
     }
-}
-
-fn copy_face(db: &fontdb::Database, id: fontdb::ID) -> Option<(Vec<u8>, u32)> {
-    db.with_face_data(id, |data, index| (data.to_vec(), index))
 }
 
 #[cfg(test)]
@@ -424,11 +648,25 @@ mod tests {
         // layout (Arch keeps ttfs two levels down, Debian adds a family dir).
         let (file, _) = system_chain().into_iter().next().expect("a system font");
         let m = MenuFont::load(file.to_str(), 16.0).expect("font file loads");
-        assert!(
-            m.fallbacks.is_empty(),
-            "explicit file means no fallback chain"
-        );
+        assert_eq!(m.face_count(), 1, "explicit file means no fallback chain");
         assert_eq!(m.size, 16.0);
+    }
+
+    #[test]
+    fn the_cjk_face_is_not_read_before_a_cjk_glyph() {
+        // Startup must read the primary only: the CJK face is 27MB and used to
+        // be read before the first frame just to draw Latin text.
+        let m = MenuFont::load(None, 16.0).expect("system font available");
+        let fallbacks = m.face_count() - 1;
+        if fallbacks == 0 {
+            return; // single-font system: nothing to be lazy about
+        }
+        assert_eq!(m.unread_faces(), fallbacks, "only the primary was read");
+        assert!(m.has_glyph('中'), "CJK must resolve on demand");
+        assert!(
+            m.unread_faces() < fallbacks,
+            "the CJK lookup must have read at least one fallback face"
+        );
     }
 
     #[test]
@@ -461,14 +699,54 @@ mod tests {
         )];
         let chain = vec![(font.clone(), 3u32)];
         write_cache(&path, &key, &chain);
-        assert_eq!(read_cache(&path, &key), Some(chain));
+        assert_eq!(read_cache(&path, &key), Some(chain.clone()));
         // A changed dir mtime (font added/removed) invalidates the cache.
         let stale = vec![(
             font.clone(),
             std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_600_000_000),
         )];
         assert_eq!(read_cache(&path, &stale), None);
+        // ...but the chain is still readable, which is what serve-stale uses.
+        assert_eq!(read_chain(&path), Some(chain));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_usable_stale_chain_beats_rescanning() {
+        let mk = |p: &str| vec![(PathBuf::from(p), 0u32)];
+        let have = |p: &Path| p == Path::new("/have.ttf");
+        assert!(matches!(
+            cache_use(Some(mk("/have.ttf")), None, have),
+            CacheUse::Fresh(_)
+        ));
+        // Key mismatch, paths intact: serve now, refresh on a thread.
+        assert!(matches!(
+            cache_use(None, Some(mk("/have.ttf")), have),
+            CacheUse::Stale(_)
+        ));
+        // A vanished path is never served, fresh or stale.
+        assert!(matches!(
+            cache_use(Some(mk("/gone.ttf")), Some(mk("/gone.ttf")), have),
+            CacheUse::None
+        ));
+        assert!(matches!(cache_use(None, None, have), CacheUse::None));
+    }
+
+    #[test]
+    fn family_cache_name_is_per_family_and_weight() {
+        let normal = family_file_name("Noto Sans Mono", fontdb::Weight::NORMAL);
+        assert_eq!(normal, "font-family-400-Noto_Sans_Mono");
+        assert_ne!(
+            normal,
+            family_file_name("Noto Sans Mono", fontdb::Weight::BOLD)
+        );
+        assert_ne!(
+            normal,
+            family_file_name("Noto Sans CJK SC", fontdb::Weight::NORMAL)
+        );
+        // Odd/long families still make one legal filename.
+        let long = family_file_name(&"\u{dc}nicode fa/mily ".repeat(20), fontdb::Weight::NORMAL);
+        assert!(long.len() < 255 && !long.contains('/'));
     }
 
     #[test]
@@ -503,6 +781,33 @@ mod tests {
     }
 
     #[test]
+    fn provisional_row_height_matches_the_loaded_font() {
+        // The layer surface commits at `row_h_for(size)` before the font exists,
+        // so the two must agree for every size a spec can ask for.
+        let (file, _) = system_chain().into_iter().next().expect("a system font");
+        for size in [13.0, 16.0, 32.0, 20.0 * 96.0 / 72.0] {
+            let m = MenuFont::load(file.to_str(), size).expect("font file loads");
+            assert_eq!(m.row_h, row_h_for(size), "size {size}");
+        }
+        let m = MenuFont::load(Some("Noto Sans Mono 12"), 16.0).expect("family loads");
+        assert_eq!(m.row_h, row_h_for(m.size));
+    }
+
+    #[test]
+    fn spec_size_matches_what_load_will_use() {
+        assert_eq!(spec_size(None, 16.0), 16.0);
+        // Family + size token: `Npx` is absolute, a bare number is points.
+        assert_eq!(spec_size(Some("Noto Sans Mono 20px"), 16.0), 20.0);
+        assert_eq!(spec_size(Some("Noto Sans Mono 12"), 16.0), 16.0);
+        // A readable path is used as a font file and carries no size token.
+        let (file, _) = system_chain().into_iter().next().expect("a system font");
+        assert_eq!(spec_size(file.to_str(), 16.0), 16.0);
+        // Whatever it predicts must be what the font actually comes out as.
+        let m = MenuFont::load(Some("Noto Sans Mono 20px"), 16.0).expect("family loads");
+        assert_eq!(m.size, spec_size(Some("Noto Sans Mono 20px"), 16.0));
+    }
+
+    #[test]
     fn parse_family_plain_and_multiword() {
         let (fam, w, sz) = parse_spec("monospace");
         assert_eq!(fam, "monospace");
@@ -525,8 +830,6 @@ mod tests {
     fn fallback_chain_covers_cjk_for_latin_primary() {
         // Noto Sans Mono has no CJK glyphs; the chain must resolve them.
         let m = MenuFont::load(Some("Noto Sans Mono"), 13.0).expect("system font available");
-        let latin = m.font.as_scaled(PxScale::from(m.size)).glyph_id('a');
-        assert_ne!(latin, GlyphId(0));
         assert!(m.has_glyph('a'));
         assert!(
             m.has_glyph('中'),

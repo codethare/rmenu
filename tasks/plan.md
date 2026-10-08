@@ -221,3 +221,64 @@
 风险：首行/末行仍必须被外层圆角裁剪，不能覆盖透明角外像素。
 
 验证检查点：全量 `cargo test`、`cargo fmt --check`、`cargo clippy`。
+# Plan: startup-font-latency（启动偶发延迟）
+
+## 实测（release；headless sway 空闲；/usr/share/fonts = 655 文件 / 422MB；均为「进程启动 → 首帧 attach」）
+
+| 场景 | 中位 | 尾部 |
+|---|---|---|
+| `-h`（只 spawn + parse_opts，无字体无 Wayland） | 7.5 ms | 23 ms |
+| **默认**（字体链：27MB CJK TTC 主字体 + 0.6MB mono + 2.5MB nerd） | 26–32 ms | 41–82 ms |
+| `-f /path/mono.ttf`（单面 0.6MB） | 17–23 ms | 30 ms |
+| `-f "Noto Sans Mono"`（family 名，每次全量 fontdb 扫描） | 62–76 ms | 86 ms |
+| `--run`（桌面扫描在后台线程） | 28–34 ms | 34 ms |
+
+分解：Wayland 握手（首个协议请求 → 首帧 attach，`WAYLAND_DEBUG` 时间戳差）6.5–14.5 ms，中位 8 ms；
+其余即字体获取 ≈ 15 ms（中位，暖页缓存），尾部到 40–70 ms。
+
+两条硬证据：
+
+1. 隔夜未读的 27MB TTC 首读 **92 ms**，之后 13–16 ms → 冷页缓存约 +75 ms/27MB、+100 ms 量级整体。
+2. `~/.cache/rmenu/font-chain` 于 **2026-10-08 07:04:49** 被重写，紧接着那次启动耗时 **2927 ms**：
+   `/usr/share/fonts` mtime 在 10-06 变更 → 缓存键失效 → 全量扫描 + 30MB 冷读。
+
+## 根因
+
+- R1 字体获取（字节读 + 可选全量扫描）串在 Wayland 握手**之前**，是首帧唯一门禁：
+  冷页缓存 → 秒级停顿；字体目录 mtime 变更（任何字体包升级）→ 该次启动多付 40–90 ms 扫描。
+  实测：一次这样的失效就让首帧从 ~30 ms 变成 2927 ms。
+- R2 `-f FAMILY` 永远绕过缓存：`query_family` 内部无条件 `Database::load_system_fonts()`（655 文件 / 422MB 头解析），每次启动 +35–45 ms。
+- R3 链中 fallback 面（nerd 2.5MB + mono 0.6MB）总是同步读+解析，即使只有 ASCII 文本。
+- R4 HiDPI 双载：`apply_scale` 在 configure 阶段按新字号重新 `MenuFont::load`，scale 1 那次结果被丢弃 → scale 2 上 30MB 读两遍（首帧还被这次重载推迟）。
+- R5 不可控：进程 spawn 5–10 ms（`-h` 尾部到 23 ms 全是调度噪声）、合成器 configure 往返。
+
+## 方案（按 收益/风险 排序）
+
+1. **P1 缓存失效不再阻塞首帧**（R1 主因，最小 diff）——`cached_system_chain` 改为 serve-stale：
+   键不匹配但缓存里的路径都还在 → 直接用旧链渲染，同时后台线程重扫并原子写回缓存（下次启动生效）；
+   路径已失效或无缓存时才同步扫描。新增 `read_cache` 拆成「只取链」的分支 + 2 条断言
+   （键不匹配仍返回旧链；路径缺失不走旧链）。
+2. **P2 `-f FAMILY` 结果入缓存**（R2）——按 `family+weight` 生成文件名，复用现有 `read_cache`/`write_cache`
+   （同一目录 mtime 键）。断言：二次解析命中缓存且不新建 db。
+3. **P3 字体只加载一次且与握手重叠**（R3/R4）——`row_h` 只由字号决定（ab_glyph `height() == PxScale.y`），
+   字号在 `parse_spec` 里就能算出 → layer surface 可以先按**精确**的临时 row_h 提交，
+   字体加载放线程、在首帧 `draw()`（configure 之后）join，从而与合成器 configure 往返重叠；
+   `apply_scale` 与待决加载合并（scale 已知时直接按该 scale 加载，消掉 scale 1 的废载）。
+   代价：`App.font` 需要与此前不同的生命周期处理，属本轮最大改动（~50 行）。
+   设计/风险/验收细则见 `openspec/specs/SPEC-startup-font-overlap.md`。
+4. **P4 链路顺序改为 mono 主字体 + CJK 惰性**（Ask first）——默认路径 27MB → 0.6MB，
+   冷启动再省 ~75 ms；但改观感（Latin 字形与度量变化）。
+   SPEC：`openspec/specs/SPEC-font-chain-lazy.md`（`FaceState::Unread/Loaded/Failed` + `face(i)` 按需读）。
+   踩坑：缓存键只看目录 mtime → 算法改动会被旧缓存遮住，新增 `p\t{CACHE_POLICY}` 策略行（见 SPEC）。
+5. **`-o NAME` 修复**（附带发现）——`Connection::roundtrip()` 不 dispatch `registry_queue_init` 的队列，
+   `OutputState::info()` 恒为 None → `-o` 必失败。SPEC：`openspec/specs/SPEC-output-select-fix.md`。
+
+不做：常驻服务/预热（roadmap 已否，实测冷启动仅 ~30 ms）；nerd 惰性加载（省 ~3 ms，不值那份惰性机制）。
+
+风险：P1 后「装完字体立刻启动」需第二次启动才生效（rmenu 是一次性进程，实际无感）；
+P3 的临时 row_h 与真实 row_h 不一致时必须补一次 `set_size` + commit（保留校验）；
+P4 需确认 CJK/混合排版与行高观感。
+
+验证检查点：`cargo test` 全绿 + clippy 0 + fmt clean；
+手动制造缓存失效（`touch /usr/share/fonts`）后首帧仍 ≈ 30 ms（改前为秒级）；
+P1/P2 各带断言；P4 需先确认观感。

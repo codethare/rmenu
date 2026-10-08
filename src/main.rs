@@ -202,10 +202,13 @@ fn main() {
         (Vec::new(), Some(ItemFeed::spawn()))
     };
 
-    let font = font::MenuFont::load(opts.font.as_deref(), FONT_SIZE).unwrap_or_else(|e| {
-        eprintln!("rmenu: {e}");
-        exit(1)
-    });
+    // The font is read on a thread: it runs alongside the Wayland handshake
+    // below and the compositor's first configure, and is joined by the first
+    // frame (`App::ensure_font`). So the panel commits at its final row height
+    // without waiting for any font file: `row_h_for` needs only the size, which
+    // the `-f` spec already fixes.
+    let bar_h = font::row_h_for(font::spec_size(opts.font.as_deref(), FONT_SIZE));
+    let font_thread = font::spawn_load(opts.font.clone(), FONT_SIZE);
 
     let conn = Connection::connect_to_env().unwrap_or_else(|e| {
         eprintln!("rmenu: cannot connect to Wayland: {e}");
@@ -216,6 +219,9 @@ fn main() {
         exit(1);
     });
     let qh = event_queue.handle();
+    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
+    let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
+    let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
     // calloop drives both the Wayland socket and sctk's key-repeat timer, so
     // holding a key (C-p/C-n, arrows) auto-repeats at the compositor's rate.
     let mut event_loop: EventLoop<App> = EventLoop::try_new().unwrap_or_else(|e| {
@@ -223,6 +229,82 @@ fn main() {
         exit(1);
     });
     let loop_handle = event_loop.handle();
+    let mut event_queue = event_queue;
+
+    let output_state = OutputState::new(&globals, &qh);
+    let height = bar_h * (row_capacity(opts.lines) as u32 + 1);
+    let pool = SlotPool::new((opts.width * height * 4) as usize, &shm)
+        .expect("failed to allocate shm pool");
+    let item_count = items.len();
+    let mut app = App {
+        registry_state: RegistryState::new(&globals),
+        seat_state: SeatState::new(&globals, &qh),
+        output_state,
+        shm,
+        compositor,
+        layer_shell,
+        layer: None,
+        pool,
+        qh: qh.clone(),
+        keyboard: None,
+        items,
+        feed,
+        menu: MenuState::new(item_count),
+        top: 0,
+        font: None,
+        pending: Some((FONT_SIZE, font_thread)),
+        font_spec: opts.font.clone(),
+        prompt: opts.prompt.clone(),
+        width: opts.width,
+        scale: 1,
+        lines: opts.lines,
+        ci: opts.ci,
+        colors: opts.colors,
+        password: opts.password,
+        bottom: opts.bottom,
+        output_w: None,
+        dirty: false,
+        frame_pending: false,
+        blink: true,
+        next_blink: Instant::now() + BLINK_PERIOD,
+        anim: None,
+        target_h: None,
+        shown_h: bar_h,
+        first_configure: true,
+        run: opts.run,
+        no_items: false,
+        mods: Modifiers::default(),
+        // Cloned: the loop sources are inserted after the `-o` roundtrip.
+        loop_handle: loop_handle.clone(),
+    };
+
+    // `-o NAME` binds the panel to that output; the compositor picks otherwise.
+    // Output *names* arrive as events on the loop's own queue, so they have to
+    // be dispatched through it — `Connection::roundtrip` only drains the
+    // connection's inner queue, which leaves `output_state` empty and made
+    // every `-o` fail. Runs before the loop, so it costs a roundtrip only when
+    // `-o` is given.
+    let target = match opts.output.as_deref() {
+        Some(name) => {
+            event_queue.roundtrip(&mut app).unwrap_or_else(|e| {
+                eprintln!("rmenu: {e}");
+                exit(1);
+            });
+            let found = app
+                .output_state
+                .outputs()
+                .find(|o| app.output_state.info(o).and_then(|i| i.name).as_deref() == Some(name));
+            match found {
+                Some(o) => Some(o),
+                None => {
+                    eprintln!("rmenu: no output named {name}");
+                    exit(1);
+                }
+            }
+        }
+        None => None,
+    };
+
     WaylandSource::new(conn.clone(), event_queue)
         .insert(loop_handle.clone())
         .unwrap_or_else(|e| {
@@ -247,97 +329,27 @@ fn main() {
                 exit(1);
             });
     }
-    let compositor = CompositorState::bind(&globals, &qh).expect("wl_compositor missing");
-    let layer_shell = LayerShell::bind(&globals, &qh).expect("wlr-layer-shell unsupported");
-    let shm = Shm::bind(&globals, &qh).expect("wl_shm missing");
 
-    // `-o NAME` binds the panel to that output; the compositor picks otherwise.
-    // A roundtrip is needed first so the compositor has sent output names.
-    let output_state = OutputState::new(&globals, &qh);
-    let target = match opts.output.as_deref() {
-        Some(name) => {
-            conn.roundtrip().unwrap_or_else(|e| {
-                eprintln!("rmenu: {e}");
-                exit(1);
-            });
-            let found = output_state
-                .outputs()
-                .find(|o| output_state.info(o).and_then(|i| i.name).as_deref() == Some(name));
-            match found {
-                Some(o) => Some(o),
-                None => {
-                    eprintln!("rmenu: no output named {name}");
-                    exit(1);
-                }
-            }
-        }
-        None => None,
-    };
-    let height = font.row_h * (row_capacity(opts.lines) as u32 + 1);
-    let surface = compositor.create_surface(&qh);
-    let layer = layer_shell.create_layer_surface(
-        &qh,
+    let surface = app.compositor.create_surface(&app.qh);
+    let layer = app.layer_shell.create_layer_surface(
+        &app.qh,
         surface,
         Layer::Overlay,
         Some("rmenu"),
         target.as_ref(),
     );
-    layer.set_anchor(if opts.bottom {
+    layer.set_anchor(if app.bottom {
         Anchor::BOTTOM
     } else {
         Anchor::TOP
     });
-    layer.set_margin(if opts.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
+    layer.set_margin(if app.bottom { 8 } else { TOP_MARGIN }, 0, 0, 0);
     layer.set_keyboard_interactivity(KeyboardInteractivity::Exclusive);
     // Start collapsed to the single input bar (Spotlight); the list appears
     // once the query has content. The pool keeps the max height for rows.
-    layer.set_size(opts.width, font.row_h);
+    layer.set_size(app.width, bar_h);
     layer.commit();
-
-    let pool = SlotPool::new((opts.width * height * 4) as usize, &shm)
-        .expect("failed to allocate shm pool");
-
-    let item_count = items.len();
-    let bar_h = font.row_h;
-    let mut app = App {
-        registry_state: RegistryState::new(&globals),
-        seat_state: SeatState::new(&globals, &qh),
-        output_state,
-        shm,
-        compositor,
-        layer_shell,
-        layer: Some(layer),
-        pool,
-        qh: qh.clone(),
-        keyboard: None,
-        items,
-        feed,
-        menu: MenuState::new(item_count),
-        top: 0,
-        font,
-        font_spec: opts.font.clone(),
-        prompt: opts.prompt.clone(),
-        width: opts.width,
-        scale: 1,
-        lines: opts.lines,
-        ci: opts.ci,
-        colors: opts.colors,
-        password: opts.password,
-        bottom: opts.bottom,
-        output_w: None,
-        dirty: false,
-        frame_pending: false,
-        blink: true,
-        next_blink: Instant::now() + BLINK_PERIOD,
-        anim: None,
-        target_h: None,
-        shown_h: bar_h,
-        first_configure: true,
-        run: opts.run,
-        no_items: false,
-        mods: Modifiers::default(),
-        loop_handle,
-    };
+    app.layer = Some(layer);
 
     loop {
         // Sleep only as long as the next deadline allows: streaming items and a
@@ -610,7 +622,12 @@ struct App {
     feed: Option<Arc<ItemFeed>>,
     menu: MenuState,
     top: usize,
-    font: font::MenuFont,
+    /// The font, loaded on a thread at startup and re-derived on scale change;
+    /// `None` until `ensure_font` joins the load.
+    font: Option<font::MenuFont>,
+    /// In-flight load: the size it was requested at, so a scale change can tell
+    /// an obsolete load from one that already matches.
+    pending: Option<(f32, font::FontLoad)>,
     /// The `-f` spec, kept so the font can be re-derived at a new scale.
     font_spec: Option<String>,
     prompt: String,
@@ -678,6 +695,30 @@ impl App {
         }
     }
 
+    /// Install the font for this frame, joining an in-flight load. Called from
+    /// `draw` only: that is what lets a load started at startup overlap the
+    /// Wayland handshake and the configure round trip.
+    fn ensure_font(&mut self) {
+        let Some((_, handle)) = self.pending.take() else {
+            return;
+        };
+        let loaded = match handle.join() {
+            Ok(loaded) => loaded,
+            Err(_) => Err("font load panicked".to_string()),
+        };
+        match loaded {
+            Ok(font) => self.font = Some(font),
+            // Nothing to fall back to before the first frame: same contract as
+            // the old load, which ran before the Wayland connection.
+            Err(e) if self.font.is_none() => {
+                eprintln!("rmenu: {e}");
+                exit(1);
+            }
+            // A failed re-derivation keeps the previous font, as it always has.
+            Err(_) => {}
+        }
+    }
+
     /// Adopt the output's HiDPI density: re-derive the font at `scale`× the
     /// logical size, so the buffer is rendered at native density (crisp text)
     /// instead of being upscaled by the compositor.
@@ -687,9 +728,11 @@ impl App {
             return;
         }
         self.scale = scale;
-        if let Ok(font) = font::MenuFont::load(self.font_spec.as_deref(), FONT_SIZE * scale as f32)
-        {
-            self.font = font;
+        let size = FONT_SIZE * scale as f32;
+        // Keep a load that already matches; replace anything else (dropping the
+        // handle detaches that thread rather than waiting for it).
+        if !matches!(&self.pending, Some((pending, _)) if *pending == size) {
+            self.pending = Some((size, font::spawn_load(self.font_spec.clone(), size)));
         }
         self.request_draw();
     }
@@ -759,6 +802,11 @@ impl App {
         let Some(layer) = self.layer.clone() else {
             return;
         };
+        // The only join point for the font load, so the read/parse overlaps the
+        // handshake and the configure round trip that got us here.
+        self.ensure_font();
+        // Field borrow, not a method: `draw` also holds `&mut self.pool`.
+        let font = self.font.as_ref().expect("font joined before use");
 
         // Spotlight: no list until the query has content; collapse back to the
         // single input bar when the query is cleared.
@@ -790,9 +838,10 @@ impl App {
 
         let scale = self.scale;
         let w = self.width;
-        // `font.row_h` already includes the density, so heights here are buffer
+        // `row_h` already includes the density, so heights here are buffer
         // pixels; the layer surface itself is sized in logical pixels.
-        let target = self.font.row_h * (visible as u32 + 1);
+        let row_h = font.row_h;
+        let target = row_h * (visible as u32 + 1);
         // Smooth every height change: the bar expanding into a list, the list
         // growing/shrinking as the query narrows, and the collapse back to the
         // bar. Each new target restarts the ease from what is on screen now.
@@ -844,7 +893,7 @@ impl App {
             canvas,
             bw,
             h,
-            &self.font,
+            font,
             &self.prompt,
             &self.menu.query,
             self.password,
@@ -857,13 +906,9 @@ impl App {
         );
 
         // Scroll position indicator: only while the list overflows the viewport.
-        if let Some((ty, th)) = render::scroll_thumb(
-            self.font.row_h,
-            h.saturating_sub(self.font.row_h),
-            visible,
-            total,
-            self.top,
-        ) {
+        if let Some((ty, th)) =
+            render::scroll_thumb(row_h, h.saturating_sub(row_h), visible, total, self.top)
+        {
             let pad = PAD * scale;
             let tw = 3 * scale;
             let tx = bw - pad + pad.saturating_sub(tw) / 2;

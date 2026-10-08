@@ -12,6 +12,13 @@ pub const fn bgra(r: u8, g: u8, b: u8, a: u8) -> Bgra {
 /// Spotlight panel corner radius (logical px), clamped to half the panel size.
 pub const CORNER_RADIUS: u32 = 12;
 
+// Eye-comfort rules, checked at compile time (clippy: assertions on constants
+// belong here): the content inset must clear the corner radius so text never
+// grazes the curve, and the panel must float off the screen edge rather than
+// hug it.
+const _: () = assert!(crate::PAD >= CORNER_RADIUS);
+const _: () = assert!(crate::TOP_MARGIN >= 32);
+
 /// Fully transparent pixel: everything outside the rounded panel outline.
 const CLEAR: Bgra = [0, 0, 0, 0];
 
@@ -385,11 +392,12 @@ pub fn draw_text(
     let canonical = |v: f32| (v.fract() * BUCKETS_PER_PX).floor() / BUCKETS_PER_PX;
     'ch: for ch in s.chars() {
         // Walk the face chain (primary first); draw with the first face that
-        // has this glyph so CJK etc. fall back to a system font.
-        for (face_idx, face) in std::iter::once(&font.font)
-            .chain(font.fallbacks.iter())
-            .enumerate()
-        {
+        // has this glyph so CJK etc. fall back to a system font. A face beyond
+        // the primary is read on first use here.
+        for face_idx in 0..font.face_count() {
+            let Some(face) = font.face(face_idx) else {
+                continue; // unreadable face, try the next
+            };
             let scaled = face.as_scaled(scale());
             let gid = scaled.glyph_id(ch);
             if gid == GlyphId(0) {
@@ -411,7 +419,7 @@ pub fn draw_text(
                     // One neutral plane, used for every channel.
                     Subpixel::Gray => {
                         vec![raster(
-                            face,
+                            &face,
                             gid,
                             scale(),
                             point(canonical(cx), canonical(baseline)),
@@ -422,7 +430,7 @@ pub fn draw_text(
                         .map(|k| {
                             let off = k as f32 / SUBPIXEL_SAMPLES;
                             raster(
-                                face,
+                                &face,
                                 gid,
                                 scale(),
                                 point(canonical(cx) + off, canonical(baseline)),
@@ -467,7 +475,10 @@ fn measure(font: &crate::font::MenuFont, s: &str, max_w: f32) -> f32 {
     let scale = || PxScale::from(font.size);
     let mut cx = 0.0;
     'ch: for ch in s.chars() {
-        for face in std::iter::once(&font.font).chain(font.fallbacks.iter()) {
+        for face_idx in 0..font.face_count() {
+            let Some(face) = font.face(face_idx) else {
+                continue;
+            };
             let scaled = face.as_scaled(scale());
             let gid = scaled.glyph_id(ch);
             if gid == GlyphId(0) {
@@ -618,7 +629,7 @@ mod tests {
         );
 
         // Selected row (rows[0]) has the selection background.
-        let sel_px = &buf[(font.row_h * 1 * w + w / 2) as usize * 4..][..4];
+        let sel_px = &buf[(font.row_h * w + w / 2) as usize * 4..][..4];
         assert_eq!(sel_px, &colors.bg_sel);
         // Normal row (rows[1]) has the normal background.
         let norm_px = &buf[(font.row_h * 2 * w + w / 2) as usize * 4..][..4];
@@ -671,15 +682,15 @@ mod tests {
 
         assert_ne!(gray, rgb, "subpixel AA must change the rendering");
         assert!(
-            gray.chunks_exact(4).all(|p| p[0] == p[2]),
+            gray.as_chunks::<4>().0.iter().all(|p| p[0] == p[2]),
             "grayscale AA must stay colour-neutral"
         );
         assert!(
-            rgb.chunks_exact(4).any(|p| p[0] != p[2]),
+            rgb.as_chunks::<4>().0.iter().any(|p| p[0] != p[2]),
             "RGB subpixel AA must produce channel differences"
         );
         // BGR is RGB with red and blue swapped, green untouched.
-        for (a, b) in rgb.chunks_exact(4).zip(bgr.chunks_exact(4)) {
+        for (a, b) in rgb.as_chunks::<4>().0.iter().zip(bgr.as_chunks::<4>().0) {
             assert_eq!(a[0], b[2], "blue and red are mirrored");
             assert_eq!(a[2], b[0]);
             assert_eq!(a[1], b[1], "green is shared");
@@ -1008,7 +1019,7 @@ mod tests {
         let mid = font.row_h / 2;
         let px = |x: u32, y: u32| &buf[((y * w + x) * 4) as usize..][..4];
         let solid = (1..w - 3)
-            .any(|x| px(x, mid) == &colors.fg_prompt && px(x + 1, mid) == &colors.fg_prompt);
+            .any(|x| px(x, mid) == colors.fg_prompt && px(x + 1, mid) == colors.fg_prompt);
         assert!(!solid, "blinked-off caret must not be drawn");
     }
 
@@ -1198,16 +1209,14 @@ mod tests {
             font.row_h,
             font.line_h
         );
-        // Content inset must clear the corner radius so text never grazes the curve.
-        // (Constants: these are compile-time guards for the comfort rules.)
+        // Content inset vs corner radius and the top margin are compile-time
+        // guards at the top of this file; the font check below is runtime.
         assert!(
-            crate::PAD >= CORNER_RADIUS,
-            "PAD {} < radius {}",
-            crate::PAD,
-            CORNER_RADIUS
+            font.row_h as f32 >= font.line_h * 1.4,
+            "row {} should be >= 1.4x line {}",
+            font.row_h,
+            font.line_h
         );
-        // Away from the screen edge: top margin is a comfortable float, not a hug.
-        assert!(crate::TOP_MARGIN >= 32, "top margin too tight");
     }
 
     #[test]
@@ -1261,10 +1270,10 @@ mod tests {
             let mid = font.row_h / 2;
             let mut caret_x = None;
             for x in 1..w - 3 {
-                if px(x, mid) == &colors.fg_prompt
-                    && px(x + 1, mid) == &colors.fg_prompt
-                    && px(x - 1, mid) != &colors.fg_prompt
-                    && px(x + 2, mid) != &colors.fg_prompt
+                if px(x, mid) == colors.fg_prompt
+                    && px(x + 1, mid) == colors.fg_prompt
+                    && px(x - 1, mid) != colors.fg_prompt
+                    && px(x + 2, mid) != colors.fg_prompt
                 {
                     caret_x = Some(x);
                     break;
@@ -1279,7 +1288,7 @@ mod tests {
             let mut top = None;
             let mut bottom = None;
             for y in 0..font.row_h {
-                let solid = px(x, y) == &colors.fg_prompt && px(x + 1, y) == &colors.fg_prompt;
+                let solid = px(x, y) == colors.fg_prompt && px(x + 1, y) == colors.fg_prompt;
                 if solid && top.is_none() {
                     top = Some(y);
                 }
@@ -1327,10 +1336,10 @@ mod tests {
                 let mid = font.row_h / 2;
                 let at = |x: u32| &buf[((mid * w + x) * 4) as usize..][..4];
                 for x in 1..w - 3 {
-                    if at(x) == &colors.fg_prompt
-                        && at(x + 1) == &colors.fg_prompt
-                        && at(x - 1) != &colors.fg_prompt
-                        && at(x + 2) != &colors.fg_prompt
+                    if at(x) == colors.fg_prompt
+                        && at(x + 1) == colors.fg_prompt
+                        && at(x - 1) != colors.fg_prompt
+                        && at(x + 2) != colors.fg_prompt
                     {
                         return x;
                     }
